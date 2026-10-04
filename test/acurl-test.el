@@ -95,7 +95,16 @@
   (should-not (acurl--sanitize-filename "../"))
   (should-not (acurl--sanitize-filename ""))
   (should-not (acurl--sanitize-filename nil))
-  (should (<= (string-bytes (acurl--sanitize-filename (make-string 300 ?é))) 255)))
+  (should (<= (string-bytes (acurl--sanitize-filename (make-string 300 ?é))) 255))
+  ;; DEL, C1 controls, bidi overrides, zero width and line separators.
+  (should (equal (acurl--sanitize-filename "a\177b\u0085c\u202Ed\u200Be\u2028f.txt")
+                 "a_b_c_d_e_f.txt"))
+  (should (equal (acurl--sanitize-filename "con.txt") "con.txt"))
+  (let ((system-type 'windows-nt))
+    (should (equal (acurl--sanitize-filename "con.txt") "_con.txt"))
+    (should (equal (acurl--sanitize-filename "NUL") "_NUL"))
+    (should (equal (acurl--sanitize-filename "Com1.tar.gz") "_Com1.tar.gz"))
+    (should (equal (acurl--sanitize-filename "console.txt") "console.txt"))))
 
 (ert-deftest acurl-test-url-filename ()
   (should (equal (acurl--url-filename "http://h/a/b/file%20name.tar.gz?x=1#f")

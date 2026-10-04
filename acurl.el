@@ -262,16 +262,29 @@ The RFC 5987 filename* parameter is preferred over filename."
 
 (defun acurl--sanitize-filename (name)
   "Return NAME reduced to a safe base file name, or nil if nothing is left.
-Directories are dropped, control and reserved characters replaced, and
-leading dots and tildes removed so the result is never hidden, `.', `..'
-or expanded as a home directory."
+Directories are dropped, reserved characters and control and format
+characters (such as bidirectional overrides that disguise an extension)
+replaced, and leading dots and tildes removed so the result is never
+hidden, `.', `..' or expanded as a home directory.  On Windows, device
+names such as NUL or COM1 are prefixed with an underscore."
   (when name
     (let* ((base (or (car (last (split-string name "[/\\]" t))) ""))
            ;; The result fits in 255 bytes: bound the work on long names.
            (base (substring base 0 (min (length base) 255)))
-           (clean (replace-regexp-in-string
-                   "[[:cntrl:]<>:\"|?*]" "_" base t t))
+           (clean (concat
+                   (mapcar (lambda (c)
+                             (if (or (memq c '(?< ?> ?: ?\" ?| ?? ?*))
+                                     (memq (get-char-code-property c 'general-category)
+                                           '(Cc Cf Zl Zp)))
+                                 ?_
+                               c))
+                           base)))
            (clean (string-trim clean "[ .~]+" "[ .]+")))
+      (when (and (eq system-type 'windows-nt)
+                 (let ((case-fold-search t))
+                   (string-match-p "\\`\\(?:con\\|prn\\|aux\\|nul\\|com[0-9]\\|lpt[0-9]\\)\\(?:\\.\\|\\'\\)"
+                                   clean)))
+        (setq clean (concat "_" clean)))
       (while (> (string-bytes clean) 255)
         (setq clean (substring clean 0 -1)))
       (unless (string-empty-p clean) clean))))
