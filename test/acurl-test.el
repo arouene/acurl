@@ -120,9 +120,17 @@
   (should-error (acurl--check-header "@file" "x"))
   (should-error (acurl--check-header "Bad Name" "x")))
 
+(ert-deftest acurl-test-config-quote ()
+  (should (equal (acurl--config-quote "a b") "\"a b\""))
+  (should (equal (acurl--config-quote "a\"b\\c") "\"a\\\"b\\\\c\""))
+  (should-error (acurl--config-quote "a\n-o /tmp/x"))
+  (should-error (acurl--config-quote "a\rb"))
+  (should-error (acurl--config-quote "a\0b")))
+
 (ert-deftest acurl-test-request-validation ()
   (should-error (acurl-request "file:///etc/passwd"))
   (should-error (acurl-request "-o/tmp/x http://h/"))
+  (should-error (acurl-request "http://h/\noutput = /tmp/x"))
   (should-error (acurl-request "http://h/" :headers '(("X" . "a\nb"))))
   (should-error (acurl-download "http://h/" "/nonexistent-acurl-dir/x")))
 
@@ -277,6 +285,51 @@ HANDLE-FN receives a success and an error callback.  Return
   (let ((r (cdr (acurl-test--run (acurl-test--url "/nolength") :method "HEAD"))))
     (should (= (acurl-response-status r) 200))
     (should-not (acurl-response-size r))))
+
+(ert-deftest acurl-test-secrets-not-in-argv ()
+  (acurl-test--fast-retries
+   (acurl-test--with-dir dir
+     (let* ((secret "S3CRET")
+            (tricky "a\\\" --output /tmp/acurl-pwn \"\\")
+            (auth (list (cons "Authorization" (concat "Bearer " secret))))
+            (commands nil)
+            (record (lambda (&rest args)
+                      (when (equal (plist-get args :name) "acurl")
+                        (push (plist-get args :command) commands)))))
+       (acurl-test--ensure-server)
+       (advice-add 'make-process :before record)
+       (unwind-protect
+           (let* ((key (acurl-test--key))
+                  (echo (cdr (acurl-test--run
+                              (acurl-test--url (concat "/echo?token=" secret))
+                              :headers (cons (cons "X-Tricky" tricky) auth))))
+                  (redirect (cdr (acurl-test--run
+                                  (acurl-test--url (concat "/redirect/2?token=" secret))
+                                  :headers auth)))
+                  (retry (cdr (acurl-test--run
+                               (acurl-test--url (format "/fail-then-ok/%s/1/502?token=%s"
+                                                        key secret))
+                               :headers auth)))
+                  (resume (cdr (acurl-test--wait
+                                (lambda (ok ko)
+                                  (acurl-download
+                                   (acurl-test--url (format "/resumable/%s?token=%s"
+                                                            (acurl-test--key) secret))
+                                   dir :headers auth :on-success ok :on-error ko)))))
+                  (json-object-type 'alist))
+             (should (equal (alist-get 'x-tricky
+                                       (alist-get 'headers
+                                                  (json-read-from-string
+                                                   (acurl-response-body echo))))
+                            tricky))
+             (should (= (acurl-response-redirects redirect) 2))
+             (should (= (acurl-response-attempts retry) 2))
+             (should (= (acurl-response-attempts resume) 2))
+             (should (= (length commands) 6))
+             (dolist (command commands)
+               (should-not (cl-some (lambda (arg) (string-match-p secret arg)) command))))
+         (advice-remove 'make-process record))
+       (should-not (file-exists-p "/tmp/acurl-pwn"))))))
 
 (ert-deftest acurl-test-retry-after-seconds ()
   (let* ((key (acurl-test--key))

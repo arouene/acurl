@@ -122,7 +122,7 @@ When nil, a numeric suffix makes the file name unique."
   :type 'string)
 
 (defcustom acurl-extra-args nil
-  "Extra arguments passed to curl before the URL, for every request."
+  "Extra arguments passed on the curl command line, for every request."
   :type '(repeat string))
 
 (cl-defstruct (acurl-response (:constructor acurl--make-response)
@@ -289,7 +289,7 @@ one, and return BYTES unchanged otherwise."
 ;;;; Process management
 
 (defun acurl--check-header (name value)
-  "Return the curl -H argument for header NAME and VALUE.
+  "Return the curl header line for header NAME and VALUE.
 Signal an error if NAME is not a token or VALUE contains a line break."
   (let ((name (format "%s" name))
         (value (format "%s" value)))
@@ -301,8 +301,36 @@ Signal an error if NAME is not a token or VALUE contains a line break."
         (concat name ";")
       (concat name ": " value))))
 
+(defun acurl--config-quote (string)
+  "Return STRING as a double-quoted curl config value.
+Signal an error if STRING contains a line break or a null byte, which
+would end the config line."
+  (when (string-match-p "[\r\n\0]" string)
+    (error "Line break or null byte in curl config value"))
+  (concat "\"" (replace-regexp-in-string "[\\\"]" "\\\\\\&" string) "\""))
+
+(defun acurl--build-config (req)
+  "Return the curl config for REQ, holding its URL and headers.
+curl reads it from stdin, so these secrets stay out of its command line,
+which any local user can read."
+  (encode-coding-string
+   (mapconcat
+    (lambda (line) (concat line "\n"))
+    (cons (concat "url = " (acurl--config-quote (acurl--req-url req)))
+          (mapcar (lambda (h)
+                    (concat "header = "
+                            (acurl--config-quote
+                             (acurl--check-header (car h) (cdr h)))))
+                  (append (acurl--req-headers req)
+                          (when-let ((v (acurl--req-validator req)))
+                            (when (> (acurl--req-resume-from req) 0)
+                              (list (cons "If-Range" v)))))))
+    "")
+   'utf-8))
+
 (defun acurl--build-args (req)
-  "Return the curl argument list for REQ."
+  "Return the curl argument list for REQ.
+The URL and headers are passed on stdin, see `acurl--build-config'."
   (let ((method (acurl--req-method req)))
     (append
      ;; -q must come first: it disables ~/.curlrc.
@@ -325,17 +353,9 @@ Signal an error if NAME is not a token or VALUE contains a line break."
             (append (list "--data-binary" (concat "@" (acurl--req-data-file req)))
                     (unless (equal method "POST") (list "--request" method))))
            ((not (equal method "GET")) (list "--request" method)))
-     (mapcan (lambda (h)
-               (list "--header"
-                     (encode-coding-string
-                      (acurl--check-header (car h) (cdr h)) 'utf-8)))
-             (append (acurl--req-headers req)
-                     (when-let ((v (acurl--req-validator req)))
-                       (when (> (acurl--req-resume-from req) 0)
-                         (list (cons "If-Range" v))))))
      acurl-extra-args
      (acurl--req-extra-args req)
-     (list (encode-coding-string (acurl--req-url req) 'utf-8)))))
+     (list "--config" "-"))))
 
 (defun acurl--pump ()
   "Start queued requests while process slots are free."
@@ -352,18 +372,23 @@ Signal an error if NAME is not a token or VALUE contains a line break."
   (let ((buffer (generate-new-buffer " *acurl*"))
         (stderr (generate-new-buffer " *acurl-stderr*")))
     (condition-case err
-        (let ((proc (make-process
-                     :name "acurl"
-                     :buffer buffer
-                     :stderr stderr
-                     :command (cons acurl-curl-program (acurl--build-args req))
-                     :coding 'binary
-                     :connection-type 'pipe
-                     :noquery t
-                     :sentinel #'acurl--sentinel)))
+        (let* ((config (acurl--build-config req))
+               (proc (make-process
+                      :name "acurl"
+                      :buffer buffer
+                      :stderr stderr
+                      :command (cons acurl-curl-program (acurl--build-args req))
+                      :coding 'binary
+                      :connection-type 'pipe
+                      :noquery t
+                      :sentinel #'acurl--sentinel)))
           (process-put proc 'acurl-request req)
           (process-put proc 'acurl-stderr stderr)
-          (setf (acurl--req-process req) proc))
+          (setf (acurl--req-process req) proc)
+          ;; If curl exits before reading, the sentinel reports its status.
+          (ignore-errors
+            (process-send-string proc config)
+            (process-send-eof proc)))
       (error
        (kill-buffer buffer)
        (kill-buffer stderr)
@@ -614,10 +639,10 @@ an `acurl-error'; it defaults to displaying the error message.
 CONNECT-TIMEOUT and TIMEOUT are in seconds.  MAX-ATTEMPTS bounds the
 number of attempts, MAX-REDIRECTS the redirects followed.  HTTP-ERRORS
 controls whether status 400 and above is an error for body requests.
-EXTRA-ARGS is a list of strings passed to curl before the URL.
+EXTRA-ARGS is a list of strings passed on the curl command line.
 
 Defaults come from the `acurl' customization group."
-  (unless (string-match-p "\\`https?://" url)
+  (unless (string-match-p "\\`https?://[^\r\n\0]*\\'" url)
     (error "Unsupported URL: %S" url))
   (unless (executable-find acurl-curl-program)
     (error "Curl executable not found: %s" acurl-curl-program))
