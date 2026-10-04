@@ -60,7 +60,8 @@
 
 (defcustom acurl-timeout 300
   "Default maximum duration of one attempt in seconds, or nil for none.
-A download interrupted by this timeout resumes on the next attempt."
+Each redirect starts a new curl process with its own timeout.  A
+download interrupted by this timeout resumes on the next attempt."
   :type '(choice (const :tag "No limit" nil) number))
 
 (defcustom acurl-max-redirects 10
@@ -71,8 +72,11 @@ A download interrupted by this timeout resumes on the next attempt."
   "Names of the request headers kept on a redirect to another origin.
 A redirect to another scheme, host or port drops the other headers, so
 credentials such as Authorization or an API key header never reach a
-third party."
-  :type '(repeat string))
+third party.  Such a redirect that would resend the request body fails
+with a `redirect' error instead.  When t, keep every header and resend
+the body."
+  :type '(choice (const :tag "All, and resend the body" t)
+                 (repeat string)))
 
 (defcustom acurl-max-attempts 3
   "Default maximum number of attempts per request, including the first."
@@ -153,8 +157,9 @@ the number of attempts made."
                            (:copier nil))
   "Failure of a request.
 TYPE is one of `curl' (transport error), `timeout', `http' (status 400
-or above) or `cancelled'.  CODE is the curl exit code for `curl' and
-`timeout', the HTTP status for `http' and nil otherwise.  MESSAGE is a
+or above), `redirect' (redirect refused) or `cancelled'.  CODE is the
+curl exit code for `curl' and `timeout', the HTTP status for `http' and
+`redirect', and nil otherwise.  MESSAGE is a
 human readable description.  RESPONSE is the `acurl-response' when one
 was received, else nil."
   type code message response)
@@ -365,13 +370,14 @@ curl reads it from stdin, so these secrets stay out of its command line,
 which any local user can read.  After a redirect to another origin, only
 the headers listed in the redirect-headers slot of REQ are sent."
   (let* ((url (or (acurl--req-location req) (acurl--req-url req)))
-         (headers (if (equal (acurl--origin url)
-                             (acurl--origin (acurl--req-url req)))
+         (keep (acurl--req-redirect-headers req))
+         (headers (if (or (eq keep t)
+                          (equal (acurl--origin url)
+                                 (acurl--origin (acurl--req-url req))))
                       (acurl--req-headers req)
                     (cl-remove-if-not
                      (lambda (h)
-                       (member-ignore-case (format "%s" (car h))
-                                           (acurl--req-redirect-headers req)))
+                       (member-ignore-case (format "%s" (car h)) keep))
                      (acurl--req-headers req)))))
     (encode-coding-string
      (mapconcat
@@ -613,12 +619,19 @@ RESP is the redirect response, reported when the redirect is refused."
         (when-let ((data (acurl--req-data-file req)))
           (delete-file data)
           (setf (acurl--req-data-file req) nil)))
-      ;; curl rejects the spaces some servers leave in Location.
-      (setf (acurl--req-location req) (string-replace " " "%20" location))
-      (cl-incf (acurl--req-redirects req))
-      (when-let ((partial (acurl--req-partial req)))
-        (acurl--truncate partial))
-      (acurl--enqueue req t)))))
+      (if (and (acurl--req-data-file req)
+               (not (eq (acurl--req-redirect-headers req) t))
+               (not (equal (acurl--origin location)
+                           (acurl--origin (acurl--req-url req)))))
+          (acurl--finish req (acurl--make-error
+                              :type 'redirect :code status :response resp
+                              :message "Redirect to another origin with a request body"))
+        ;; curl rejects the spaces some servers leave in Location.
+        (setf (acurl--req-location req) (string-replace " " "%20" location))
+        (cl-incf (acurl--req-redirects req))
+        (when-let ((partial (acurl--req-partial req)))
+          (acurl--truncate partial))
+        (acurl--enqueue req t))))))
 
 (defun acurl--file-size (file)
   "Return the size of FILE in bytes, or 0 if it does not exist."
@@ -733,6 +746,7 @@ RESP is the final response, used to name files in directory mode."
                              (max-redirects acurl-max-redirects)
                              (http-errors acurl-http-errors)
                              (overwrite acurl-download-overwrite)
+                             (redirect-headers acurl-redirect-headers)
                              extra-args)
   "Start an asynchronous HTTP request to URL and return its handle.
 The handle can be passed to `acurl-cancel'.
@@ -752,8 +766,11 @@ ON-SUCCESS is called with an `acurl-response'.  ON-ERROR is called with
 an `acurl-error'; it defaults to displaying the host and error message.
 
 CONNECT-TIMEOUT and TIMEOUT are in seconds.  MAX-ATTEMPTS bounds the
-number of attempts, MAX-REDIRECTS the redirects followed.  A redirect to
-another origin drops HEADERS, except those in `acurl-redirect-headers'.
+number of attempts, MAX-REDIRECTS the redirects followed; each redirect
+gets its own TIMEOUT.  A redirect to another origin drops HEADERS,
+except those named in REDIRECT-HEADERS, and fails with a `redirect'
+error if it would resend BODY, unless REDIRECT-HEADERS is t, see
+`acurl-redirect-headers'.
 HTTP-ERRORS controls whether status 400 and above is an error for body
 requests.  EXTRA-ARGS is a list of strings passed on the curl command
 line.
@@ -792,7 +809,7 @@ Defaults come from the `acurl' customization group."
                 :http-errors http-errors :overwrite overwrite
                 :extra-args extra-args
                 :max-body-size acurl-max-body-size
-                :redirect-headers acurl-redirect-headers
+                :redirect-headers redirect-headers
                 :header-file (make-temp-file "acurl-headers-"))))
       (condition-case err
           (progn

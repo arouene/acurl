@@ -352,6 +352,44 @@ ARGS are passed to `acurl-request'."
     (should (= (acurl-response-status r) 200))
     (should (= (acurl-response-size r) 13))))
 
+(ert-deftest acurl-test-redirect-cross-origin-body ()
+  (acurl-test--ensure-server)
+  (let* ((key (acurl-test--key))
+         (other (format "http://localhost:%s/fail-then-ok/%s/1/500" acurl-test--port key))
+         (headers '(("Content-Type" . "application/json") ("Authorization" . "Bearer S3CRET")))
+         (out (acurl-test--run (acurl-test--redirect-url other 307)
+                               :method "PUT" :body "{}" :headers headers)))
+    (should (eq (car out) 'error))
+    (should (eq (acurl-error-type (cdr out)) 'redirect))
+    (should (= (acurl-error-code (cdr out)) 307))
+    ;; The new origin never received a request.
+    (should (= (acurl-error-code
+                (cdr (acurl-test--run other :max-attempts 1 :http-errors t)))
+               500))
+    ;; Without a body to resend, the redirect is followed.
+    (should (equal (alist-get 'method
+                              (acurl-test--echo
+                               (acurl-test--redirect-url
+                                (format "http://localhost:%s/echo" acurl-test--port))
+                               :method "POST" :body "{}" :headers headers))
+                   "GET"))
+    (dolist (url (list (acurl-test--redirect-url "/echo" 307)
+                       (acurl-test--redirect-url
+                        (format "http://localhost:%s/echo" acurl-test--port) 307)))
+      (let* ((echo (acurl-test--echo url :method "PUT" :body "{}" :headers headers
+                                     :redirect-headers t))
+             (h (alist-get 'headers echo)))
+        (should (equal (alist-get 'body echo) "{}"))
+        (should (equal (alist-get 'content-type h) "application/json"))
+        (should (equal (alist-get 'authorization h) "Bearer S3CRET"))))
+    (let* ((acurl-redirect-headers t)
+           (echo (acurl-test--echo (acurl-test--redirect-url
+                                    (format "http://localhost:%s/echo" acurl-test--port) 308)
+                                   :method "POST" :body "{}" :headers headers)))
+      (should (equal (alist-get 'body echo) "{}"))
+      (should (equal (alist-get 'content-type (alist-get 'headers echo))
+                     "application/json")))))
+
 (ert-deftest acurl-test-redirect-download ()
   (acurl-test--with-dir dir
     (let ((r (cdr (acurl-test--wait

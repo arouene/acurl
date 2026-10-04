@@ -62,11 +62,12 @@ Starts the request and returns a handle for `acurl-cancel`. Only `http://` and
 | `:on-success`      | `ignore`                    | Called with an `acurl-response`                                       |
 | `:on-error`        | display host and message    | Called with an `acurl-error`                                          |
 | `:connect-timeout` | `acurl-connect-timeout`     | Seconds to establish the connection                                   |
-| `:timeout`         | `acurl-timeout`             | Maximum seconds per attempt, `nil` for none                           |
+| `:timeout`         | `acurl-timeout`             | Maximum seconds per attempt and redirect, `nil` for none              |
 | `:max-attempts`    | `acurl-max-attempts`        | Attempts including the first                                          |
 | `:max-redirects`   | `acurl-max-redirects`       | Redirects followed                                                    |
 | `:http-errors`     | `acurl-http-errors`         | Whether status 400 and above goes to `:on-error` (body requests only) |
 | `:overwrite`       | `acurl-download-overwrite`  | Whether a download may replace an existing file                       |
+| `:redirect-headers`| `acurl-redirect-headers`    | Headers kept on a redirect to another origin, `t` for all and the body |
 | `:extra-args`      | `nil`                       | Extra curl arguments (proxy, TLS options, ...)                        |
 
 `POST`, `PUT` and `PATCH` send an empty body when `:body` is nil. curl sends
@@ -107,8 +108,8 @@ otherwise.
 
 | Accessor               | Value                                                                    |
 |------------------------|--------------------------------------------------------------------------|
-| `acurl-error-type`     | `curl` (transport), `timeout`, `http` (status >= 400) or `cancelled`     |
-| `acurl-error-code`     | curl exit code for `curl` and `timeout`, HTTP status for `http`          |
+| `acurl-error-type`     | `curl` (transport), `timeout`, `http` (status >= 400), `redirect` (refused) or `cancelled` |
+| `acurl-error-code`     | curl exit code for `curl` and `timeout`, HTTP status for `http` and `redirect` |
 | `acurl-error-message`  | Human readable message                                                   |
 | `acurl-error-response` | `acurl-response` when a response was received, with the body for `http` |
 
@@ -132,6 +133,11 @@ host or port) drops the request headers, so credentials such as
 `Authorization` or an API key header never reach a third party; they are sent
 again once a redirect leads back to the original origin. Headers named in
 `acurl-redirect-headers` (for example `'("Accept" "User-Agent")`) are kept.
+A redirect to another origin that would resend the request body (307, 308, or
+301 and 302 after a method other than `POST`) fails with a `redirect` error and
+nothing is sent to the new origin; set `acurl-redirect-headers` or
+`:redirect-headers` to `t` to follow it with the body and every header. Each
+redirect is a new curl run, so `:timeout` applies to each one.
 
 **Resume.** A download writes to a hidden `.acurl-*.part` file next to its
 destination. A retry resumes it with a range request, guarded by `If-Range`
