@@ -10,6 +10,7 @@
 (require 'acurl)
 (require 'ert)
 (require 'json)
+(require 'url-util)
 
 (defconst acurl-test--dir
   (file-name-directory (or load-file-name buffer-file-name)))
@@ -111,6 +112,26 @@
     (should (equal (acurl--decode-body bytes "application/octet-stream") bytes))
     (should (equal (acurl--decode-body bytes nil) bytes)))
   (should (equal (acurl--decode-body "\351" "text/plain; charset=ISO-8859-1") "é")))
+
+(ert-deftest acurl-test-hostile-values-linear-time ()
+  ;; Server values reach curl's 100 KB header limit: quadratic parsing
+  ;; froze Emacs for minutes.
+  (let ((spaces (make-string 100000 ?\s))
+        (escapes (apply #'concat (make-list 33000 "%41")))
+        (start (float-time)))
+    (should (equal (acurl--parse-headers
+                    (concat "HTTP/1.1 200 OK\r\nX: a" spaces "b" spaces "\r\n"
+                            "Y: a\r\n " spaces "c" spaces "\r\n\r\n"))
+                   `(("x" . ,(concat "a" spaces "b")) ("y" . "a c"))))
+    (should (equal (acurl--content-disposition-filename
+                    (concat "attachment; filename=a" spaces "b" spaces "; x=1"))
+                   (concat "a" spaces "b")))
+    (should (= (length (acurl--content-disposition-filename
+                        (concat "attachment; filename*=UTF-8''" escapes))) 33000))
+    (should (= (length (acurl--url-filename (concat "http://h/" escapes))) 33000))
+    (should (equal (acurl--sanitize-filename (concat (make-string 100000 ?a) spaces))
+                   (make-string 255 ?a)))
+    (should (< (- (float-time) start) 2))))
 
 (ert-deftest acurl-test-check-header ()
   (should (equal (acurl--check-header "X-A" "1") "X-A: 1"))

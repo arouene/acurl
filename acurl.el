@@ -44,7 +44,6 @@
 (require 'parse-time)
 (require 'subr-x)
 (require 'url-parse)
-(require 'url-util)
 
 (defgroup acurl nil
   "Asynchronous HTTP client built on curl."
@@ -180,12 +179,14 @@ alist of (LOWERCASE-NAME . VALUE) for the last block, in order."
                            blocks))))
          headers)
     (when last
+      ;; Values end at their last non-blank character: a lazy match or
+      ;; `string-trim' before trailing blanks takes quadratic time.
       (dolist (line (cdr (split-string last "\r?\n" t)))
         (cond
-         ((and headers (string-match-p "\\`[ \t]" line))
+         ((and headers (string-match "\\`[ \t]+\\(\\(?:.*[^ \t]\\)?\\)" line))
           (setcdr (car headers)
-                  (concat (cdar headers) " " (string-trim line))))
-         ((string-match "\\`\\([^:]+\\):[ \t]*\\(.*?\\)[ \t]*\\'" line)
+                  (concat (cdar headers) " " (match-string 1 line))))
+         ((string-match "\\`\\([^:]+\\):[ \t]*\\(\\(?:.*[^ \t]\\)?\\)" line)
           (push (cons (downcase (match-string 1 line))
                       (acurl--decode-header-value (match-string 2 line)))
                 headers)))))
@@ -218,12 +219,20 @@ current time and is used for HTTP-dates."
                   (time-subtract (encode-time parsed)
                                  (or now (current-time))))))))))
 
+(defun acurl--unhex (string)
+  "Return STRING with its %XX escapes decoded to bytes.
+Unlike `url-unhex-string', this takes linear time on long values."
+  (replace-regexp-in-string
+   "%[0-9A-Fa-f][0-9A-Fa-f]"
+   (lambda (escape) (unibyte-string (string-to-number (substring escape 1) 16)))
+   string t t))
+
 (defun acurl--decode-rfc5987 (value)
   "Decode RFC 5987 ext-value VALUE, as in filename*=UTF-8\\='\\='a%20b.
 Return nil for an unsupported charset or a malformed value."
   (when (string-match "\\`\\([^']*\\)'[^']*'\\(.*\\)\\'" value)
     (let ((charset (downcase (match-string 1 value)))
-          (bytes (url-unhex-string (match-string 2 value))))
+          (bytes (acurl--unhex (match-string 2 value))))
       (cond ((equal charset "utf-8") (decode-coding-string bytes 'utf-8))
             ((equal charset "iso-8859-1") (decode-coding-string bytes 'latin-1))))))
 
@@ -234,11 +243,11 @@ The RFC 5987 filename* parameter is preferred over filename."
     (let ((pos 0) params)
       (while (string-match
               (concat ";[ \t]*\\([^=; \t]+\\)[ \t]*=[ \t]*"
-                      "\\(\"\\(?:[^\"\\]\\|\\\\.\\)*\"\\|[^;]*\\)")
+                      "\\(\"\\(?:[^\"\\]\\|\\\\.\\)*\"\\|\\(?:[^;]*[^; \t]\\)?\\)")
               value pos)
         (setq pos (match-end 0))
         (let ((name (downcase (match-string 1 value)))
-              (raw (string-trim-right (match-string 2 value))))
+              (raw (match-string 2 value)))
           (push (cons name
                       (if (string-prefix-p "\"" raw)
                           (replace-regexp-in-string
@@ -256,6 +265,8 @@ leading dots and tildes removed so the result is never hidden, `.', `..'
 or expanded as a home directory."
   (when name
     (let* ((base (or (car (last (split-string name "[/\\]" t))) ""))
+           ;; The result fits in 255 bytes: bound the work on long names.
+           (base (substring base 0 (min (length base) 255)))
            (clean (replace-regexp-in-string
                    "[[:cntrl:]<>:\"|?*]" "_" base t t))
            (clean (string-trim clean "[ .~]+" "[ .]+")))
@@ -269,7 +280,7 @@ or expanded as a home directory."
     (let* ((path (car (url-path-and-query (url-generic-parse-url url))))
            (segment (and path (car (last (split-string path "/" t))))))
       (when segment
-        (decode-coding-string (url-unhex-string segment) 'utf-8)))))
+        (decode-coding-string (acurl--unhex segment) 'utf-8)))))
 
 (defun acurl--decode-body (bytes content-type)
   "Decode response BYTES according to CONTENT-TYPE.
