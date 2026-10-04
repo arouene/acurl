@@ -129,16 +129,17 @@ timers and never block.
 destination. A retry resumes it with a range request, guarded by `If-Range`
 with the ETag (or Last-Modified) of the first response. If the server ignores
 the range or the resource changed (200 instead of 206), or the server rejects
-the range (416), the download restarts from scratch. On success the file is renamed atomically to its final name; on
-failure or cancellation it is removed. Downloads always treat status 400 and
-above as an error, and error bodies never reach the file.
+the range (416), the download restarts from scratch. On success the file is
+renamed atomically to its final name; on failure or cancellation it is removed.
+Downloads always treat status 400 and above as an error, and error bodies never
+reach the file.
 
 **File names.** In directory mode the name comes from the Content-Disposition
 `filename*` (RFC 5987) or `filename` parameter, then the last path segment of
 the final URL, then `acurl-default-filename`. Path components, control
-characters and leading dots are stripped. An existing file is never replaced
-unless `:overwrite` is non-nil: `name-1.ext`, `name-2.ext`, ... are used
-instead. This also applies to explicit file names.
+characters, leading dots and leading tildes are stripped. An existing file is
+never replaced unless `:overwrite` is non-nil: `name-1.ext`, `name-2.ext`, ...
+are used instead. This also applies to explicit file names.
 
 **Concurrency.** At most `acurl-max-concurrent` curl processes run at once;
 other requests wait in a queue.
