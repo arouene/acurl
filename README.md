@@ -91,7 +91,7 @@ an error of type `cancelled`.
 | `acurl-response-status`         | Final HTTP status, after redirects                         |
 | `acurl-response-url`            | Final URL                                                  |
 | `acurl-response-content-type`   | Content-Type of the final response                         |
-| `acurl-response-size`           | Body size in bytes, or size of the saved file              |
+| `acurl-response-size`           | Body size in bytes, size of the saved file, or for `HEAD` the announced Content-Length (`nil` when absent) |
 | `acurl-response-headers`        | Alist `(LOWERCASE-NAME . VALUE)` of the final response     |
 | `acurl-response-body`           | Body string (body requests), `nil` for downloads           |
 | `acurl-response-file`           | Absolute path of the saved file (downloads)                |
@@ -126,9 +126,10 @@ request: connection failures and status 429 or 503. Retries wait on Emacs
 timers and never block.
 
 **Resume.** A download writes to a hidden `.acurl-*.part` file next to its
-destination. A retry resumes it with a range request. If the server ignores
-the range (200 instead of 206) or rejects it (416), the download restarts from
-scratch. On success the file is renamed atomically to its final name; on
+destination. A retry resumes it with a range request, guarded by `If-Range`
+with the ETag (or Last-Modified) of the first response. If the server ignores
+the range or the resource changed (200 instead of 206), or the server rejects
+the range (416), the download restarts from scratch. On success the file is renamed atomically to its final name; on
 failure or cancellation it is removed. Downloads always treat status 400 and
 above as an error, and error bodies never reach the file.
 

@@ -85,6 +85,9 @@
   (should (equal (acurl--sanitize-filename "/abs/path.txt") "path.txt"))
   (should (equal (acurl--sanitize-filename "C:\\Windows\\evil.exe") "evil.exe"))
   (should (equal (acurl--sanitize-filename ".bashrc") "bashrc"))
+  (should (equal (acurl--sanitize-filename "~root") "root"))
+  (should (equal (acurl--sanitize-filename ".~/x~") "x~"))
+  (should-not (acurl--sanitize-filename "~"))
   (should (equal (acurl--sanitize-filename "a\nb<c>.txt") "a_b_c_.txt"))
   (should (equal (acurl--sanitize-filename "été.txt") "été.txt"))
   (should-not (acurl--sanitize-filename ".."))
@@ -269,7 +272,11 @@ HANDLE-FN receives a success and an error callback.  Return
         (should (equal (alist-get 'method echo) method)))))
   (let ((r (cdr (acurl-test--run (acurl-test--url "/text") :method "HEAD"))))
     (should (= (acurl-response-status r) 200))
-    (should (equal (acurl-response-body r) ""))))
+    (should (equal (acurl-response-body r) ""))
+    (should (= (acurl-response-size r) 13)))
+  (let ((r (cdr (acurl-test--run (acurl-test--url "/nolength") :method "HEAD"))))
+    (should (= (acurl-response-status r) 200))
+    (should-not (acurl-response-size r))))
 
 (ert-deftest acurl-test-retry-after-seconds ()
   (let* ((key (acurl-test--key))
@@ -469,6 +476,35 @@ HANDLE-FN receives a success and an error callback.  Return
        (should (equal (acurl--read-file (acurl-response-file r)) (acurl-test--payload)))
        (should (equal (acurl-test--get-json (format "/ranges/%s" key))
                       '(nil "bytes=51200-" nil)))))))
+
+(ert-deftest acurl-test-download-resource-changed ()
+  (acurl-test--fast-retries
+   (acurl-test--with-dir dir
+     (let* ((key (acurl-test--key))
+            (r (cdr (acurl-test--wait
+                     (lambda (ok ko)
+                       (acurl-download (acurl-test--url (format "/changed/%s" key))
+                                       (concat dir "out.bin")
+                                       :on-success ok :on-error ko))))))
+       (should (= (acurl-response-status r) 200))
+       (should (equal (acurl--read-file (acurl-response-file r))
+                      (reverse (acurl-test--payload))))
+       (should (equal (acurl-test--get-json (format "/ranges/%s" key))
+                      '((nil nil) ("bytes=51200-" "\"v1\"") (nil nil))))))))
+
+(ert-deftest acurl-test-download-416-without-resume ()
+  (acurl-test--fast-retries
+   (acurl-test--with-dir dir
+     (let* ((key (acurl-test--key))
+            (out (acurl-test--wait
+                  (lambda (ok ko)
+                    (acurl-download (acurl-test--url (format "/fail-then-ok/%s/1/416" key))
+                                    dir :on-success ok :on-error ko)))))
+       (should (eq (car out) 'error))
+       (should (= (acurl-error-code (cdr out)) 416))
+       (should (equal (acurl-response-body
+                       (cdr (acurl-test--run (acurl-test--url (format "/count/%s" key)))))
+                      "1"))))))
 
 (ert-deftest acurl-test-download-resume-after-error-status ()
   (acurl-test--fast-retries

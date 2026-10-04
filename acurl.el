@@ -130,7 +130,8 @@ When nil, a numeric suffix makes the file name unique."
   "Result of a request.
 STATUS is the final HTTP status after redirects, URL the final URL,
 HEADERS an alist of (LOWERCASE-NAME . VALUE) from the final response,
-CONTENT-TYPE its Content-Type, SIZE the body size in bytes, BODY the
+CONTENT-TYPE its Content-Type, SIZE the body size in bytes (for HEAD,
+the announced Content-Length, or nil when absent), BODY the
 body string for body requests, FILE the absolute path of the saved file
 for downloads, REDIRECTS the number of redirects followed and ATTEMPTS
 the number of attempts made."
@@ -152,7 +153,7 @@ was received, else nil."
   connect-timeout timeout max-attempts max-redirects http-errors
   overwrite extra-args
   (attempt 1) (state 'queued) process timer
-  data-file header-file body-file partial resume-from disposition)
+  data-file header-file body-file partial resume-from validator disposition)
 
 (defvar acurl--queue nil
   "Requests waiting for a free process slot, in start order.")
@@ -251,12 +252,13 @@ The RFC 5987 filename* parameter is preferred over filename."
 (defun acurl--sanitize-filename (name)
   "Return NAME reduced to a safe base file name, or nil if nothing is left.
 Directories are dropped, control and reserved characters replaced, and
-leading dots removed so the result is never hidden, `.' or `..'."
+leading dots and tildes removed so the result is never hidden, `.', `..'
+or expanded as a home directory."
   (when name
     (let* ((base (or (car (last (split-string name "[/\\]" t))) ""))
            (clean (replace-regexp-in-string
                    "[[:cntrl:]<>:\"|?*]" "_" base t t))
-           (clean (string-trim clean "[ .]+" "[ .]+")))
+           (clean (string-trim clean "[ .~]+" "[ .]+")))
       (while (> (string-bytes clean) 255)
         (setq clean (substring clean 0 -1)))
       (unless (string-empty-p clean) clean))))
@@ -327,7 +329,10 @@ Signal an error if NAME is not a token or VALUE contains a line break."
                (list "--header"
                      (encode-coding-string
                       (acurl--check-header (car h) (cdr h)) 'utf-8)))
-             (acurl--req-headers req))
+             (append (acurl--req-headers req)
+                     (when-let ((v (acurl--req-validator req)))
+                       (when (> (acurl--req-resume-from req) 0)
+                         (list (cons "If-Range" v))))))
      acurl-extra-args
      (acurl--req-extra-args req)
      (list (encode-coding-string (acurl--req-url req) 'utf-8)))))
@@ -428,17 +433,30 @@ the final response headers."
                                                         exit)))))))
     (when-let ((cd (cdr (assoc "content-disposition" headers))))
       (setf (acurl--req-disposition req) cd))
-    (unless partial
-      (let ((bytes (if (equal (acurl--req-method req) "HEAD")
-                       ""
-                     (or (acurl--read-file (acurl--req-body-file req)) ""))))
+    (when (and partial (= (acurl--req-resume-from req) 0))
+      (setf (acurl--req-validator req)
+            (let ((etag (cdr (assoc "etag" headers))))
+              (if (and etag (not (string-prefix-p "W/" etag)))
+                  etag
+                (cdr (assoc "last-modified" headers))))))
+    (cond
+     ((and (not partial) (equal (acurl--req-method req) "HEAD"))
+      (let ((len (cdr (assoc "content-length" headers))))
+        (setf (acurl-response-body resp) ""
+              (acurl-response-size resp)
+              (and len (string-match-p "\\`[0-9]+\\'" len)
+                   (string-to-number len)))))
+     ((not partial)
+      (let ((bytes (or (acurl--read-file (acurl--req-body-file req)) "")))
         (setf (acurl-response-size resp) (length bytes)
               (acurl-response-body resp)
-              (acurl--decode-body bytes (acurl-response-content-type resp)))))
+              (acurl--decode-body bytes (acurl-response-content-type resp))))))
     (cond
-     ;; Partial file rejected: the server ignored the range (33) or
-     ;; cannot satisfy it (416).  Restart from scratch, no attempt used.
-     ((and partial (or (= exit 33) (= status 416)))
+     ;; Partial file rejected: the server ignored the range or the
+     ;; resource changed (33), or it cannot satisfy the range (416).
+     ;; Restart from scratch, no attempt used.
+     ((and partial (> (acurl--req-resume-from req) 0)
+           (or (= exit 33) (= status 416)))
       (acurl--truncate partial)
       (acurl--enqueue req t))
      ((and err (acurl--retry-p req err))

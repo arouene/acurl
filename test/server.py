@@ -39,9 +39,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if self.command != "HEAD":
             self.wfile.write(body)
 
-    def truncated(self, body):
+    def truncated(self, body, headers=None):
         """Announce BODY but send only half of it, then drop the connection."""
         self.send_response(200)
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.send_header("Content-Type", "application/octet-stream")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Accept-Ranges", "bytes")
@@ -162,6 +164,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.reply(503, b"<html>busy</html>", {"Retry-After": "0"})
             else:
                 self.ranged(key, PAYLOAD)
+        elif name == "changed":
+            # /changed/KEY: truncated v1, then v2 honoring Range only when
+            # If-Range matches, like a release replaced at the same URL.
+            key = args[0]
+            rng = self.headers.get("Range")
+            if_range = self.headers.get("If-Range")
+            with LOCK:
+                RANGES.setdefault(key, []).append([rng, if_range])
+            body = PAYLOAD[::-1]
+            if hit(key) == 1:
+                self.truncated(PAYLOAD, {"ETag": '"v1"'})
+            elif rng and if_range in (None, '"v2"'):
+                start = int(rng.split("=")[1].split("-")[0])
+                self.reply(206, body[start:], {
+                    "ETag": '"v2"',
+                    "Content-Range": f"bytes {start}-{len(body) - 1}/{len(body)}",
+                })
+            else:
+                self.reply(200, body, {"ETag": '"v2"'})
+        elif name == "nolength":
+            self.send_response(200)
+            self.end_headers()
+            self.close_connection = True
         elif name == "cd":
             self.reply(200, b"cd body", {
                 "Content-Type": "application/octet-stream",
