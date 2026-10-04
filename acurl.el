@@ -295,8 +295,10 @@ names such as NUL or COM1 are prefixed with an underscore."
            (clean (string-trim clean "[ .~]+" "[ .]+")))
       (when (and (eq system-type 'windows-nt)
                  (let ((case-fold-search t))
-                   (string-match-p "\\`\\(?:con\\|prn\\|aux\\|nul\\|com[0-9]\\|lpt[0-9]\\)\\(?:\\.\\|\\'\\)"
-                                   clean)))
+                   (string-match-p
+                    (concat "\\`\\(?:con\\|prn\\|aux\\|nul\\|com[0-9]\\|lpt[0-9]\\)"
+                            "\\(?:\\.\\|\\'\\)")
+                    clean)))
         (setq clean (concat "_" clean)))
       (while (> (string-bytes clean) 255)
         (setq clean (substring clean 0 -1)))

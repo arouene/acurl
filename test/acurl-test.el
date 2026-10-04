@@ -645,6 +645,21 @@ ARGS are passed to `acurl-request'."
                           (acurl-download url dir :overwrite t :on-success ok :on-error ko)))
       (should (= (length (directory-files dir nil "\\`[^.]")) 3)))))
 
+(ert-deftest acurl-test-download-never-follows-symlink ()
+  (acurl-test--with-dir dir
+    (let ((victim (concat dir "victim"))
+          (url (acurl-test--url
+                (concat "/cd?v=" (url-hexify-string "attachment; filename=\"link\"")))))
+      (write-region "keep" nil victim nil 'silent)
+      (make-symbolic-link victim (concat dir "link"))
+      (acurl-test--wait (lambda (ok ko) (acurl-download url dir :on-success ok :on-error ko)))
+      (should (equal (acurl--read-file (concat dir "link-1")) "cd body"))
+      (acurl-test--wait (lambda (ok ko)
+                          (acurl-download url dir :overwrite t :on-success ok :on-error ko)))
+      (should-not (file-symlink-p (concat dir "link")))
+      (should (equal (acurl--read-file (concat dir "link")) "cd body"))
+      (should (equal (acurl--read-file victim) "keep")))))
+
 (ert-deftest acurl-test-download-url-name-and-file ()
   (acurl-test--with-dir dir
     (let ((r (cdr (acurl-test--wait
