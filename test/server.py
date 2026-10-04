@@ -86,6 +86,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             n = int(args[0])
             target = f"/redirect/{n - 1}" if n > 1 else "/text"
             self.reply(302, b"", {"Location": target})
+        elif name == "redirect-to":
+            # /redirect-to?url=URL&status=N, with a body and a file name
+            # that must not reach a download.
+            self.reply(int(query.get("status", "302")), b"redirect body", {
+                "Location": query["url"],
+                "Content-Disposition": 'attachment; filename="wrong.txt"',
+            })
         elif name == "redirect-loop":
             self.reply(302, b"", {"Location": "/redirect-loop"})
         elif name == "echo":
@@ -99,7 +106,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # /retry-after/KEY/FORM: 503 with Retry-After once, then 200.
             key, form = args
             if hit(key) == 1:
-                value = "1" if form == "seconds" else email.utils.formatdate(time.time() + 1, usegmt=True)
+                value = {
+                    "seconds": "1",
+                    "date": email.utils.formatdate(time.time() + 1, usegmt=True),
+                    "unrepresentable": "Wed, 21 Oct 99999999999 07:28:00 GMT",
+                }[form]
                 self.reply(503, b"busy", {"Retry-After": value})
             else:
                 self.reply(200, b"ok", {"Content-Type": "text/plain"})
@@ -192,6 +203,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "Content-Type": "application/octet-stream",
                 "Content-Disposition": query["v"],
             })
+        elif name == "size":
+            self.reply(200, b"x" * int(args[0]), {"Content-Type": "application/octet-stream"})
+        elif name == "chunked":
+            # N bytes without Content-Length.
+            self.send_response(200)
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            for _ in range(int(args[0]) // 1000):
+                self.wfile.write(b"3e8\r\n" + b"x" * 1000 + b"\r\n")
+            self.wfile.write(b"0\r\n\r\n")
         elif name == "files":
             self.reply(200, b"file body", {"Content-Type": "text/plain"})
         else:

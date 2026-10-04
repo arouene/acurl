@@ -44,7 +44,6 @@
 (require 'parse-time)
 (require 'subr-x)
 (require 'url-parse)
-(require 'url-util)
 
 (defgroup acurl nil
   "Asynchronous HTTP client built on curl."
@@ -61,12 +60,23 @@
 
 (defcustom acurl-timeout 300
   "Default maximum duration of one attempt in seconds, or nil for none.
-A download interrupted by this timeout resumes on the next attempt."
+Each redirect starts a new curl process with its own timeout.  A
+download interrupted by this timeout resumes on the next attempt."
   :type '(choice (const :tag "No limit" nil) number))
 
 (defcustom acurl-max-redirects 10
   "Default maximum number of redirects to follow."
   :type 'natnum)
+
+(defcustom acurl-redirect-headers nil
+  "Names of the request headers kept on a redirect to another origin.
+A redirect to another scheme, host or port drops the other headers, so
+credentials such as Authorization or an API key header never reach a
+third party.  Such a redirect that would resend the request body fails
+with a `redirect' error instead.  When t, keep every header and resend
+the body."
+  :type '(choice (const :tag "All, and resend the body" t)
+                 (repeat string)))
 
 (defcustom acurl-max-attempts 3
   "Default maximum number of attempts per request, including the first."
@@ -108,6 +118,12 @@ When nil, such responses go to the success callback.  Downloads always
 report them as errors."
   :type 'boolean)
 
+(defcustom acurl-max-body-size (* 100 1024 1024)
+  "Maximum size in bytes of a response body read into memory, or nil.
+A larger body fails with curl exit code 63, so a server cannot exhaust
+the memory of Emacs.  Downloads are not limited."
+  :type '(choice (const :tag "No limit" nil) natnum))
+
 (defcustom acurl-max-concurrent 6
   "Maximum number of curl processes running at the same time."
   :type 'natnum)
@@ -141,8 +157,9 @@ the number of attempts made."
                            (:copier nil))
   "Failure of a request.
 TYPE is one of `curl' (transport error), `timeout', `http' (status 400
-or above) or `cancelled'.  CODE is the curl exit code for `curl' and
-`timeout', the HTTP status for `http' and nil otherwise.  MESSAGE is a
+or above), `redirect' (redirect refused) or `cancelled'.  CODE is the
+curl exit code for `curl' and `timeout', the HTTP status for `http' and
+`redirect', and nil otherwise.  MESSAGE is a
 human readable description.  RESPONSE is the `acurl-response' when one
 was received, else nil."
   type code message response)
@@ -151,8 +168,8 @@ was received, else nil."
                           (:copier nil))
   url method headers body output directory-p on-success on-error
   connect-timeout timeout max-attempts max-redirects http-errors
-  overwrite extra-args
-  (attempt 1) (state 'queued) process timer
+  overwrite extra-args max-body-size redirect-headers
+  location (redirects 0) (attempt 1) (state 'queued) process timer
   data-file header-file body-file partial resume-from validator disposition)
 
 (defvar acurl--queue nil
@@ -180,12 +197,14 @@ alist of (LOWERCASE-NAME . VALUE) for the last block, in order."
                            blocks))))
          headers)
     (when last
+      ;; Values end at their last non-blank character: a lazy match or
+      ;; `string-trim' before trailing blanks takes quadratic time.
       (dolist (line (cdr (split-string last "\r?\n" t)))
         (cond
-         ((and headers (string-match-p "\\`[ \t]" line))
+         ((and headers (string-match "\\`[ \t]+\\(\\(?:.*[^ \t]\\)?\\)" line))
           (setcdr (car headers)
-                  (concat (cdar headers) " " (string-trim line))))
-         ((string-match "\\`\\([^:]+\\):[ \t]*\\(.*?\\)[ \t]*\\'" line)
+                  (concat (cdar headers) " " (match-string 1 line))))
+         ((string-match "\\`\\([^:]+\\):[ \t]*\\(\\(?:.*[^ \t]\\)?\\)" line)
           (push (cons (downcase (match-string 1 line))
                       (acurl--decode-header-value (match-string 2 line)))
                 headers)))))
@@ -211,19 +230,29 @@ current time and is used for HTTP-dates."
   (when value
     (if (string-match "\\`[ \t]*\\([0-9]+\\)[ \t]*\\'" value)
         (string-to-number (match-string 1 value))
-      (let ((parsed (parse-time-string value)))
-        (when (and (cl-every #'integerp (cl-subseq parsed 0 6))
-                   (nth 8 parsed))
+      (let* ((parsed (parse-time-string value))
+             (time (and (cl-every #'integerp (cl-subseq parsed 0 6))
+                        (nth 8 parsed)
+                        ;; Signals for a year out of range.
+                        (ignore-errors (encode-time parsed)))))
+        (when time
           (max 0 (float-time
-                  (time-subtract (encode-time parsed)
-                                 (or now (current-time))))))))))
+                  (time-subtract time (or now (current-time))))))))))
+
+(defun acurl--unhex (string)
+  "Return STRING with its %XX escapes decoded to bytes.
+Unlike `url-unhex-string', this takes linear time on long values."
+  (replace-regexp-in-string
+   "%[0-9A-Fa-f][0-9A-Fa-f]"
+   (lambda (escape) (unibyte-string (string-to-number (substring escape 1) 16)))
+   string t t))
 
 (defun acurl--decode-rfc5987 (value)
   "Decode RFC 5987 ext-value VALUE, as in filename*=UTF-8\\='\\='a%20b.
 Return nil for an unsupported charset or a malformed value."
   (when (string-match "\\`\\([^']*\\)'[^']*'\\(.*\\)\\'" value)
     (let ((charset (downcase (match-string 1 value)))
-          (bytes (url-unhex-string (match-string 2 value))))
+          (bytes (acurl--unhex (match-string 2 value))))
       (cond ((equal charset "utf-8") (decode-coding-string bytes 'utf-8))
             ((equal charset "iso-8859-1") (decode-coding-string bytes 'latin-1))))))
 
@@ -234,11 +263,11 @@ The RFC 5987 filename* parameter is preferred over filename."
     (let ((pos 0) params)
       (while (string-match
               (concat ";[ \t]*\\([^=; \t]+\\)[ \t]*=[ \t]*"
-                      "\\(\"\\(?:[^\"\\]\\|\\\\.\\)*\"\\|[^;]*\\)")
+                      "\\(\"\\(?:[^\"\\]\\|\\\\.\\)*\"\\|\\(?:[^;]*[^; \t]\\)?\\)")
               value pos)
         (setq pos (match-end 0))
         (let ((name (downcase (match-string 1 value)))
-              (raw (string-trim-right (match-string 2 value))))
+              (raw (match-string 2 value)))
           (push (cons name
                       (if (string-prefix-p "\"" raw)
                           (replace-regexp-in-string
@@ -251,14 +280,31 @@ The RFC 5987 filename* parameter is preferred over filename."
 
 (defun acurl--sanitize-filename (name)
   "Return NAME reduced to a safe base file name, or nil if nothing is left.
-Directories are dropped, control and reserved characters replaced, and
-leading dots and tildes removed so the result is never hidden, `.', `..'
-or expanded as a home directory."
+Directories are dropped, reserved characters and control and format
+characters (such as bidirectional overrides that disguise an extension)
+replaced, and leading dots and tildes removed so the result is never
+hidden, `.', `..' or expanded as a home directory.  On Windows, device
+names such as NUL or COM1 are prefixed with an underscore."
   (when name
     (let* ((base (or (car (last (split-string name "[/\\]" t))) ""))
-           (clean (replace-regexp-in-string
-                   "[[:cntrl:]<>:\"|?*]" "_" base t t))
+           ;; The result fits in 255 bytes: bound the work on long names.
+           (base (substring base 0 (min (length base) 255)))
+           (clean (concat
+                   (mapcar (lambda (c)
+                             (if (or (memq c '(?< ?> ?: ?\" ?| ?? ?*))
+                                     (memq (get-char-code-property c 'general-category)
+                                           '(Cc Cf Zl Zp)))
+                                 ?_
+                               c))
+                           base)))
            (clean (string-trim clean "[ .~]+" "[ .]+")))
+      (when (and (eq system-type 'windows-nt)
+                 (let ((case-fold-search t))
+                   (string-match-p
+                    (concat "\\`\\(?:con\\|prn\\|aux\\|nul\\|com[0-9]\\|lpt[0-9]\\)"
+                            "\\(?:\\.\\|\\'\\)")
+                    clean)))
+        (setq clean (concat "_" clean)))
       (while (> (string-bytes clean) 255)
         (setq clean (substring clean 0 -1)))
       (unless (string-empty-p clean) clean))))
@@ -269,7 +315,7 @@ or expanded as a home directory."
     (let* ((path (car (url-path-and-query (url-generic-parse-url url))))
            (segment (and path (car (last (split-string path "/" t))))))
       (when segment
-        (decode-coding-string (url-unhex-string segment) 'utf-8)))))
+        (decode-coding-string (acurl--unhex segment) 'utf-8)))))
 
 (defun acurl--decode-body (bytes content-type)
   "Decode response BYTES according to CONTENT-TYPE.
@@ -277,7 +323,7 @@ Use the charset parameter when known, UTF-8 for textual types without
 one, and return BYTES unchanged otherwise."
   (let* ((ct (downcase (or content-type "")))
          (charset (and (string-match "charset=\"?\\([^\";[:space:]]+\\)" ct)
-                       (intern (match-string 1 ct))))
+                       (intern-soft (match-string 1 ct))))
          (coding (cond ((and charset (coding-system-p charset)) charset)
                        ((string-match-p
                          (concat "\\`\\(?:text/\\|application/"
@@ -288,12 +334,15 @@ one, and return BYTES unchanged otherwise."
 
 ;;;; Process management
 
+(defconst acurl--token-regexp "\\`[!#$%&'*+.^_`|~0-9A-Za-z-]+\\'"
+  "Regexp matching an HTTP token, the syntax of methods and header names.")
+
 (defun acurl--check-header (name value)
   "Return the curl header line for header NAME and VALUE.
 Signal an error if NAME is not a token or VALUE contains a line break."
   (let ((name (format "%s" name))
         (value (format "%s" value)))
-    (unless (string-match-p "\\`[!#$%&'*+.^_`|~0-9A-Za-z-]+\\'" name)
+    (unless (string-match-p acurl--token-regexp name)
       (error "Invalid header name: %S" name))
     (when (string-match-p "[\r\n\0]" value)
       (error "Invalid header value for %s" name))
@@ -309,45 +358,64 @@ would end the config line."
     (error "Line break or null byte in curl config value"))
   (concat "\"" (replace-regexp-in-string "[\\\"]" "\\\\\\&" string) "\""))
 
+(defun acurl--origin (url)
+  "Return the scheme, host and port of URL."
+  (let ((u (url-generic-parse-url url)))
+    (list (downcase (url-type u)) (downcase (or (url-host u) ""))
+          (url-port u))))
+
 (defun acurl--build-config (req)
   "Return the curl config for REQ, holding its URL and headers.
 curl reads it from stdin, so these secrets stay out of its command line,
-which any local user can read."
-  (encode-coding-string
-   (mapconcat
-    (lambda (line) (concat line "\n"))
-    (cons (concat "url = " (acurl--config-quote (acurl--req-url req)))
-          (mapcar (lambda (h)
-                    (concat "header = "
-                            (acurl--config-quote
-                             (acurl--check-header (car h) (cdr h)))))
-                  (append (acurl--req-headers req)
-                          (when-let ((v (acurl--req-validator req)))
-                            (when (> (acurl--req-resume-from req) 0)
-                              (list (cons "If-Range" v)))))))
-    "")
-   'utf-8))
+which any local user can read.  After a redirect to another origin, only
+the headers listed in the redirect-headers slot of REQ are sent."
+  (let* ((url (or (acurl--req-location req) (acurl--req-url req)))
+         (keep (acurl--req-redirect-headers req))
+         (headers (if (or (eq keep t)
+                          (equal (acurl--origin url)
+                                 (acurl--origin (acurl--req-url req))))
+                      (acurl--req-headers req)
+                    (cl-remove-if-not
+                     (lambda (h)
+                       (member-ignore-case (format "%s" (car h)) keep))
+                     (acurl--req-headers req)))))
+    (encode-coding-string
+     (mapconcat
+      (lambda (line) (concat line "\n"))
+      (cons (concat "url = " (acurl--config-quote url))
+            (mapcar (lambda (h)
+                      (concat "header = "
+                              (acurl--config-quote
+                               (acurl--check-header (car h) (cdr h)))))
+                    (append headers
+                            (when-let* ((v (acurl--req-validator req)))
+                              (when (> (acurl--req-resume-from req) 0)
+                                (list (cons "If-Range" v)))))))
+      "")
+     'utf-8)))
 
 (defun acurl--build-args (req)
   "Return the curl argument list for REQ.
 The URL and headers are passed on stdin, see `acurl--build-config'."
   (let ((method (acurl--req-method req)))
     (append
-     ;; -q must come first: it disables ~/.curlrc.
-     (list "-q" "--silent" "--globoff"
-           "--proto" "=http,https" "--proto-redir" "=http,https"
-           "--location" "--max-redirs"
-           (number-to-string (acurl--req-max-redirects req))
+     ;; -q must come first: it disables ~/.curlrc.  Redirects are
+     ;; followed by `acurl--follow', which controls the headers sent.
+     (list "-q" "--silent" "--globoff" "--proto" "=http,https"
            "--dump-header" (acurl--req-header-file req)
            "--write-out" "%{json}")
-     (when-let ((ct (acurl--req-connect-timeout req)))
+     (when-let* ((ct (acurl--req-connect-timeout req)))
        (list "--connect-timeout" (number-to-string ct)))
-     (when-let ((tt (acurl--req-timeout req)))
+     (when-let* ((tt (acurl--req-timeout req)))
        (list "--max-time" (number-to-string tt)))
      (if (acurl--req-partial req)
          ;; --fail keeps error bodies out of the partial file.
          (list "--fail" "--continue-at" "-" "--output" (acurl--req-partial req))
-       (list "--output" (acurl--req-body-file req)))
+       (append (list "--output" (acurl--req-body-file req))
+               ;; HEAD would fail on a large Content-Length.
+               (when-let* ((limit (and (not (equal method "HEAD"))
+                                       (acurl--req-max-body-size req))))
+                 (list "--max-filesize" (number-to-string limit)))))
      (cond ((equal method "HEAD") (list "--head"))
            ((acurl--req-data-file req)
             (append (list "--data-binary" (concat "@" (acurl--req-data-file req)))
@@ -367,7 +435,7 @@ The URL and headers are passed on stdin, see `acurl--build-config'."
   (setf (acurl--req-state req) 'running)
   (cl-incf acurl--active)
   (acurl--truncate (acurl--req-header-file req))
-  (when-let ((partial (acurl--req-partial req)))
+  (when-let* ((partial (acurl--req-partial req)))
     (setf (acurl--req-resume-from req) (acurl--file-size partial)))
   (let ((buffer (generate-new-buffer " *acurl*"))
         (stderr (generate-new-buffer " *acurl-stderr*")))
@@ -434,15 +502,28 @@ EXIT is the curl exit code, WRITE-OUT the parsed metadata and HEADERS
 the final response headers."
   (let* ((status (or (alist-get 'http_code write-out) 0))
          (partial (acurl--req-partial req))
+         (location (let ((target (alist-get 'redirect_url write-out)))
+                     (and (memq status '(301 302 303 307 308))
+                          (stringp target) (not (string-empty-p target))
+                          target)))
+         ;; curl before 8.4 does not stop a body of unknown size.
+         (oversized (and (not partial)
+                         (acurl--req-max-body-size req)
+                         (> (acurl--file-size (acurl--req-body-file req))
+                            (acurl--req-max-body-size req))))
          (resp (acurl--make-response
                 :status status
                 :url (or (alist-get 'url_effective write-out)
+                         (acurl--req-location req)
                          (acurl--req-url req))
                 :headers headers
                 :content-type (alist-get 'content_type write-out)
-                :redirects (alist-get 'num_redirects write-out)
+                :redirects (acurl--req-redirects req)
                 :attempts (acurl--req-attempt req)))
          (err (cond
+               (oversized
+                (acurl--make-error :type 'curl :code 63 :response resp
+                                   :message "Maximum file size exceeded"))
                ((and (= exit 0) (< status 400)) nil)
                ((= exit 28)
                 (acurl--make-error :type 'timeout :code exit :response resp
@@ -456,7 +537,8 @@ the final response headers."
                                    :message (or (alist-get 'errormsg write-out)
                                                 (format "curl exited with code %d"
                                                         exit)))))))
-    (when-let ((cd (cdr (assoc "content-disposition" headers))))
+    (when-let* ((cd (and (not location)
+                         (cdr (assoc "content-disposition" headers)))))
       (setf (acurl--req-disposition req) cd))
     (when (and partial (= (acurl--req-resume-from req) 0))
       (setf (acurl--req-validator req)
@@ -472,11 +554,14 @@ the final response headers."
               (and len (string-match-p "\\`[0-9]+\\'" len)
                    (string-to-number len)))))
      ((not partial)
-      (let ((bytes (or (acurl--read-file (acurl--req-body-file req)) "")))
+      (let ((bytes (or (and (not oversized)
+                                (acurl--read-file (acurl--req-body-file req)))
+                           "")))
         (setf (acurl-response-size resp) (length bytes)
               (acurl-response-body resp)
               (acurl--decode-body bytes (acurl-response-content-type resp))))))
     (cond
+     ((and location (not err)) (acurl--follow req resp location))
      ;; Partial file rejected: the server ignored the range or the
      ;; resource changed (33), or it cannot satisfy the range (416).
      ;; Restart from scratch, no attempt used.
@@ -508,6 +593,45 @@ the final response headers."
                 (acurl-response-file resp) file
                 (acurl-response-size resp) (acurl--file-size file))
           (acurl--finish req nil resp)))))))
+
+(defun acurl--follow (req resp location)
+  "Start the next request of REQ to redirect target LOCATION.
+RESP is the redirect response, reported when the redirect is refused."
+  (let ((status (acurl-response-status resp))
+        (method (acurl--req-method req)))
+    (cond
+     ((>= (acurl--req-redirects req) (acurl--req-max-redirects req))
+      (acurl--finish req (acurl--make-error
+                          :type 'curl :code 47 :response resp
+                          :message (format "Maximum (%d) redirects followed"
+                                           (acurl--req-max-redirects req)))))
+     ((not (string-match-p "\\`https?://" location))
+      (acurl--finish req (acurl--make-error
+                          :type 'curl :code 1 :response resp
+                          :message "Redirect to an unsupported protocol")))
+     (t
+      ;; As curl and browsers do: 303, and 301 or 302 after POST, switch
+      ;; to GET without a body.
+      (when (and (not (equal method "HEAD"))
+                 (or (= status 303)
+                     (and (memq status '(301 302)) (equal method "POST"))))
+        (setf (acurl--req-method req) "GET")
+        (when-let* ((data (acurl--req-data-file req)))
+          (delete-file data)
+          (setf (acurl--req-data-file req) nil)))
+      (if (and (acurl--req-data-file req)
+               (not (eq (acurl--req-redirect-headers req) t))
+               (not (equal (acurl--origin location)
+                           (acurl--origin (acurl--req-url req)))))
+          (acurl--finish req (acurl--make-error
+                              :type 'redirect :code status :response resp
+                              :message "Redirect to another origin with a request body"))
+        ;; curl rejects the spaces some servers leave in Location.
+        (setf (acurl--req-location req) (string-replace " " "%20" location))
+        (cl-incf (acurl--req-redirects req))
+        (when-let* ((partial (acurl--req-partial req)))
+          (acurl--truncate partial))
+        (acurl--enqueue req t))))))
 
 (defun acurl--file-size (file)
   "Return the size of FILE in bytes, or 0 if it does not exist."
@@ -590,18 +714,22 @@ RESP is the final response, used to name files in directory mode."
              (setq n (1+ n)
                    candidate (concat (file-name-sans-extension target)
                                      "-" (number-to-string n)
-                                     (if-let ((ext (file-name-extension target)))
+                                     (if-let* ((ext (file-name-extension target)))
                                          (concat "." ext)
                                        ""))))))
         candidate))))
 
-(defun acurl--finish (req err &optional resp)
-  "Mark REQ as done, clean up and call its callback with ERR or RESP."
-  (setf (acurl--req-state req) 'done)
+(defun acurl--delete-files (req)
+  "Delete the temporary files of REQ."
   (dolist (file (list (acurl--req-data-file req) (acurl--req-header-file req)
                       (acurl--req-body-file req) (acurl--req-partial req)))
     (when (and file (file-exists-p file))
-      (delete-file file)))
+      (delete-file file))))
+
+(defun acurl--finish (req err &optional resp)
+  "Mark REQ as done, clean up and call its callback with ERR or RESP."
+  (setf (acurl--req-state req) 'done)
+  (acurl--delete-files req)
   (acurl--pump)
   (if err
       (funcall (acurl--req-on-error req) err)
@@ -618,6 +746,7 @@ RESP is the final response, used to name files in directory mode."
                              (max-redirects acurl-max-redirects)
                              (http-errors acurl-http-errors)
                              (overwrite acurl-download-overwrite)
+                             (redirect-headers acurl-redirect-headers)
                              extra-args)
   "Start an asynchronous HTTP request to URL and return its handle.
 The handle can be passed to `acurl-cancel'.
@@ -634,12 +763,17 @@ named after the Content-Disposition header, the URL or
 a numeric suffix added unless OVERWRITE is non-nil.
 
 ON-SUCCESS is called with an `acurl-response'.  ON-ERROR is called with
-an `acurl-error'; it defaults to displaying the error message.
+an `acurl-error'; it defaults to displaying the host and error message.
 
 CONNECT-TIMEOUT and TIMEOUT are in seconds.  MAX-ATTEMPTS bounds the
-number of attempts, MAX-REDIRECTS the redirects followed.  HTTP-ERRORS
-controls whether status 400 and above is an error for body requests.
-EXTRA-ARGS is a list of strings passed on the curl command line.
+number of attempts, MAX-REDIRECTS the redirects followed; each redirect
+gets its own TIMEOUT.  A redirect to another origin drops HEADERS,
+except those named in REDIRECT-HEADERS, and fails with a `redirect'
+error if it would resend BODY, unless REDIRECT-HEADERS is t, see
+`acurl-redirect-headers'.
+HTTP-ERRORS controls whether status 400 and above is an error for body
+requests.  EXTRA-ARGS is a list of strings passed on the curl command
+line.
 
 Defaults come from the `acurl' customization group."
   (unless (string-match-p "\\`https?://[^\r\n\0]*\\'" url)
@@ -647,6 +781,8 @@ Defaults come from the `acurl' customization group."
   (unless (executable-find acurl-curl-program)
     (error "Curl executable not found: %s" acurl-curl-program))
   (dolist (h headers) (acurl--check-header (car h) (cdr h)))
+  (unless (string-match-p acurl--token-regexp method)
+    (error "Invalid method: %S" method))
   (let* ((method (upcase method))
          (body (or body (and (member method '("POST" "PUT" "PATCH")) "")))
          (directory-p (and output (or (directory-name-p output)
@@ -662,28 +798,37 @@ Defaults come from the `acurl' customization group."
                 :directory-p directory-p
                 :on-success (or on-success #'ignore)
                 :on-error (or on-error
+                              ;; The rest of the URL may hold secrets.
                               (lambda (err)
-                                (message "acurl: %s: %s" url
+                                (message "acurl: %s: %s"
+                                         (url-host (url-generic-parse-url url))
                                          (acurl-error-message err))))
                 :connect-timeout connect-timeout :timeout timeout
                 :max-attempts (max 1 max-attempts)
                 :max-redirects max-redirects
                 :http-errors http-errors :overwrite overwrite
                 :extra-args extra-args
+                :max-body-size acurl-max-body-size
+                :redirect-headers redirect-headers
                 :header-file (make-temp-file "acurl-headers-"))))
-      (when body
-        (let ((file (make-temp-file "acurl-data-"))
-              (coding-system-for-write 'binary))
-          (setf (acurl--req-data-file req) file)
-          (write-region (if (multibyte-string-p body)
-                            (encode-coding-string body 'utf-8)
-                          body)
-                        nil file nil 'silent)))
-      (if output
-          (setf (acurl--req-partial req)
-                (make-temp-file (expand-file-name ".acurl-" target-dir)
-                                nil ".part"))
-        (setf (acurl--req-body-file req) (make-temp-file "acurl-body-")))
+      (condition-case err
+          (progn
+            (when body
+              (let ((file (make-temp-file "acurl-data-"))
+                    (coding-system-for-write 'binary))
+                (setf (acurl--req-data-file req) file)
+                (write-region (if (multibyte-string-p body)
+                                  (encode-coding-string body 'utf-8)
+                                body)
+                              nil file nil 'silent)))
+            (if output
+                (setf (acurl--req-partial req)
+                      (make-temp-file (expand-file-name ".acurl-" target-dir)
+                                      nil ".part"))
+              (setf (acurl--req-body-file req) (make-temp-file "acurl-body-"))))
+        ;; The data file holds the body, which may be secret.
+        (t (acurl--delete-files req)
+           (signal (car err) (cdr err))))
       (acurl--enqueue req)
       req)))
 

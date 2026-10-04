@@ -10,6 +10,7 @@
 (require 'acurl)
 (require 'ert)
 (require 'json)
+(require 'url-util)
 
 (defconst acurl-test--dir
   (file-name-directory (or load-file-name buffer-file-name)))
@@ -94,7 +95,16 @@
   (should-not (acurl--sanitize-filename "../"))
   (should-not (acurl--sanitize-filename ""))
   (should-not (acurl--sanitize-filename nil))
-  (should (<= (string-bytes (acurl--sanitize-filename (make-string 300 ?é))) 255)))
+  (should (<= (string-bytes (acurl--sanitize-filename (make-string 300 ?é))) 255))
+  ;; DEL, C1 controls, bidi overrides, zero width and line separators.
+  (should (equal (acurl--sanitize-filename "a\177b\u0085c\u202Ed\u200Be\u2028f.txt")
+                 "a_b_c_d_e_f.txt"))
+  (should (equal (acurl--sanitize-filename "con.txt") "con.txt"))
+  (let ((system-type 'windows-nt))
+    (should (equal (acurl--sanitize-filename "con.txt") "_con.txt"))
+    (should (equal (acurl--sanitize-filename "NUL") "_NUL"))
+    (should (equal (acurl--sanitize-filename "Com1.tar.gz") "_Com1.tar.gz"))
+    (should (equal (acurl--sanitize-filename "console.txt") "console.txt"))))
 
 (ert-deftest acurl-test-url-filename ()
   (should (equal (acurl--url-filename "http://h/a/b/file%20name.tar.gz?x=1#f")
@@ -110,7 +120,30 @@
     (should (equal (acurl--decode-body bytes "application/vnd.api+json") "é"))
     (should (equal (acurl--decode-body bytes "application/octet-stream") bytes))
     (should (equal (acurl--decode-body bytes nil) bytes)))
-  (should (equal (acurl--decode-body "\351" "text/plain; charset=ISO-8859-1") "é")))
+  (should (equal (acurl--decode-body "\351" "text/plain; charset=ISO-8859-1") "é"))
+  ;; A server must not grow the obarray with names of its choice.
+  (should (equal (acurl--decode-body "x" "text/plain; charset=acurl-test-no-such-charset") "x"))
+  (should-not (intern-soft "acurl-test-no-such-charset")))
+
+(ert-deftest acurl-test-hostile-values-linear-time ()
+  ;; Server values reach curl's 100 KB header limit: quadratic parsing
+  ;; froze Emacs for minutes.
+  (let ((spaces (make-string 100000 ?\s))
+        (escapes (apply #'concat (make-list 33000 "%41")))
+        (start (float-time)))
+    (should (equal (acurl--parse-headers
+                    (concat "HTTP/1.1 200 OK\r\nX: a" spaces "b" spaces "\r\n"
+                            "Y: a\r\n " spaces "c" spaces "\r\n\r\n"))
+                   `(("x" . ,(concat "a" spaces "b")) ("y" . "a c"))))
+    (should (equal (acurl--content-disposition-filename
+                    (concat "attachment; filename=a" spaces "b" spaces "; x=1"))
+                   (concat "a" spaces "b")))
+    (should (= (length (acurl--content-disposition-filename
+                        (concat "attachment; filename*=UTF-8''" escapes))) 33000))
+    (should (= (length (acurl--url-filename (concat "http://h/" escapes))) 33000))
+    (should (equal (acurl--sanitize-filename (concat (make-string 100000 ?a) spaces))
+                   (make-string 255 ?a)))
+    (should (< (- (float-time) start) 2))))
 
 (ert-deftest acurl-test-check-header ()
   (should (equal (acurl--check-header "X-A" "1") "X-A: 1"))
@@ -132,7 +165,23 @@
   (should-error (acurl-request "-o/tmp/x http://h/"))
   (should-error (acurl-request "http://h/\noutput = /tmp/x"))
   (should-error (acurl-request "http://h/" :headers '(("X" . "a\nb"))))
+  (should-error (acurl-request "http://h/" :method "GET / HTTP/1.1\r\nX-Injected: 1\r\nX:"))
+  (should-error (acurl-request "http://h/" :method "GET /other"))
   (should-error (acurl-download "http://h/" "/nonexistent-acurl-dir/x")))
+
+(ert-deftest acurl-test-request-error-cleans-temp-files ()
+  (let* ((dir (file-name-as-directory (make-temp-file "acurl-test-" t)))
+         (temporary-file-directory dir)
+         (make-temp-file-orig (symbol-function 'make-temp-file)))
+    (unwind-protect
+        (cl-letf (((symbol-function 'make-temp-file)
+                   (lambda (prefix &rest args)
+                     (if (string-match-p "\\.acurl-" prefix)
+                         (error "Disk full")
+                       (apply make-temp-file-orig prefix args)))))
+          (should-error (acurl-download "http://127.0.0.1:1/" dir :body "secret"))
+          (should-not (directory-files dir nil "\\`[^.]")))
+      (delete-directory dir t))))
 
 ;;;; Integration
 
@@ -242,6 +291,118 @@ HANDLE-FN receives a success and an error callback.  Return
     (should (eq (acurl-error-type (cdr out)) 'curl))
     (should (= (acurl-error-code (cdr out)) 47))))
 
+(defun acurl-test--redirect-url (target &optional status)
+  "Return a test server URL redirecting to TARGET with STATUS."
+  (acurl-test--url (format "/redirect-to?status=%s&url=%s"
+                           (or status 302) (url-hexify-string target))))
+
+(defun acurl-test--echo (url &rest args)
+  "Return the request seen by the /echo endpoint at the end of URL.
+ARGS are passed to `acurl-request'."
+  (let ((json-object-type 'alist))
+    (json-read-from-string
+     (acurl-response-body (cdr (apply #'acurl-test--run url args))))))
+
+(ert-deftest acurl-test-redirect-cross-origin-headers ()
+  (acurl-test--ensure-server)
+  (let ((headers '(("Authorization" . "Bearer S3CRET") ("X-Api-Key" . "S3CRET")
+                   ("Accept" . "application/json")))
+        (other (format "http://localhost:%s/echo" acurl-test--port)))
+    (let ((h (alist-get 'headers (acurl-test--echo (acurl-test--redirect-url "/echo")
+                                                   :headers headers))))
+      (should (equal (alist-get 'authorization h) "Bearer S3CRET"))
+      (should (equal (alist-get 'x-api-key h) "S3CRET")))
+    (let ((h (alist-get 'headers (acurl-test--echo (acurl-test--redirect-url other)
+                                                   :headers headers))))
+      (should-not (alist-get 'authorization h))
+      (should-not (alist-get 'x-api-key h))
+      (should-not (equal (alist-get 'accept h) "application/json")))
+    ;; Back on the original origin, the headers are sent again.
+    (let ((h (alist-get 'headers (acurl-test--echo
+                                  (acurl-test--redirect-url
+                                   (format "http://localhost:%s/redirect-to?url=%s"
+                                           acurl-test--port
+                                           (url-hexify-string (acurl-test--url "/echo"))))
+                                  :headers headers))))
+      (should (equal (alist-get 'x-api-key h) "S3CRET")))
+    (let* ((acurl-redirect-headers '("accept" "X-Api-Key"))
+           (h (alist-get 'headers (acurl-test--echo (acurl-test--redirect-url other)
+                                                    :headers headers))))
+      (should-not (alist-get 'authorization h))
+      (should (equal (alist-get 'x-api-key h) "S3CRET"))
+      (should (equal (alist-get 'accept h) "application/json")))))
+
+(ert-deftest acurl-test-redirect-protocols ()
+  (dolist (target '("file:///etc/passwd" "ftp://127.0.0.1/x"))
+    (let ((out (acurl-test--run (acurl-test--redirect-url target))))
+      (should (eq (car out) 'error))
+      (should (eq (acurl-error-type (cdr out)) 'curl))
+      (should (= (acurl-error-code (cdr out)) 1)))))
+
+(ert-deftest acurl-test-redirect-methods ()
+  (pcase-dolist (`(,method ,status ,new-method ,new-body)
+                 '(("POST" 302 "GET" "") ("POST" 303 "GET" "")
+                   ("POST" 307 "POST" "data") ("POST" 308 "POST" "data")
+                   ("PUT" 302 "PUT" "data") ("PUT" 303 "GET" "")))
+    (let ((echo (acurl-test--echo (acurl-test--redirect-url "/echo" status)
+                                  :method method :body "data")))
+      (should (equal (list method status (alist-get 'method echo) (alist-get 'body echo))
+                     (list method status new-method new-body)))))
+  (let ((r (cdr (acurl-test--run (acurl-test--redirect-url "/text" 303) :method "HEAD"))))
+    (should (= (acurl-response-status r) 200))
+    (should (= (acurl-response-size r) 13))))
+
+(ert-deftest acurl-test-redirect-cross-origin-body ()
+  (acurl-test--ensure-server)
+  (let* ((key (acurl-test--key))
+         (other (format "http://localhost:%s/fail-then-ok/%s/1/500" acurl-test--port key))
+         (headers '(("Content-Type" . "application/json") ("Authorization" . "Bearer S3CRET")))
+         (out (acurl-test--run (acurl-test--redirect-url other 307)
+                               :method "PUT" :body "{}" :headers headers)))
+    (should (eq (car out) 'error))
+    (should (eq (acurl-error-type (cdr out)) 'redirect))
+    (should (= (acurl-error-code (cdr out)) 307))
+    ;; The new origin never received a request.
+    (should (= (acurl-error-code
+                (cdr (acurl-test--run other :max-attempts 1 :http-errors t)))
+               500))
+    ;; Without a body to resend, the redirect is followed.
+    (should (equal (alist-get 'method
+                              (acurl-test--echo
+                               (acurl-test--redirect-url
+                                (format "http://localhost:%s/echo" acurl-test--port))
+                               :method "POST" :body "{}" :headers headers))
+                   "GET"))
+    (dolist (url (list (acurl-test--redirect-url "/echo" 307)
+                       (acurl-test--redirect-url
+                        (format "http://localhost:%s/echo" acurl-test--port) 307)))
+      (let* ((echo (acurl-test--echo url :method "PUT" :body "{}" :headers headers
+                                     :redirect-headers t))
+             (h (alist-get 'headers echo)))
+        (should (equal (alist-get 'body echo) "{}"))
+        (should (equal (alist-get 'content-type h) "application/json"))
+        (should (equal (alist-get 'authorization h) "Bearer S3CRET"))))
+    (let* ((acurl-redirect-headers t)
+           (echo (acurl-test--echo (acurl-test--redirect-url
+                                    (format "http://localhost:%s/echo" acurl-test--port) 308)
+                                   :method "POST" :body "{}" :headers headers)))
+      (should (equal (alist-get 'body echo) "{}"))
+      (should (equal (alist-get 'content-type (alist-get 'headers echo))
+                     "application/json")))))
+
+(ert-deftest acurl-test-redirect-download ()
+  (acurl-test--with-dir dir
+    (let ((r (cdr (acurl-test--wait
+                   (lambda (ok ko)
+                     ;; curl leaves the space of an absolute Location.
+                     (acurl-download (acurl-test--redirect-url
+                                      (acurl-test--url "/files/a b.txt"))
+                                     dir
+                                     :on-success ok :on-error ko))))))
+      (should (equal (acurl-response-file r) (expand-file-name "a b.txt" dir)))
+      (should (= (acurl-response-redirects r) 1))
+      (should (equal (acurl--read-file (acurl-response-file r)) "file body")))))
+
 (ert-deftest acurl-test-http-errors ()
   (let ((out (acurl-test--run (acurl-test--url "/status/404"))))
     (should (eq (car out) 'error))
@@ -258,6 +419,55 @@ HANDLE-FN receives a success and an error callback.  Return
     (should (eq (acurl-error-type (cdr out)) 'curl))
     (should (= (acurl-error-code (cdr out)) 7))
     (should (stringp (acurl-error-message (cdr out))))))
+
+(ert-deftest acurl-test-default-error-message-hides-secrets ()
+  (let (logged)
+    (cl-letf (((symbol-function 'message)
+               (lambda (format &rest args)
+                 (when format (push (apply #'format-message format args) logged)))))
+      (acurl-request "http://user:S3CRET@127.0.0.1:1/S3CRET?token=S3CRET" :max-attempts 1)
+      (with-timeout (10 (error "No error message"))
+        (while (not (cl-some (lambda (m) (string-prefix-p "acurl:" m)) logged))
+          (accept-process-output nil 0.05))))
+    (let ((m (cl-find-if (lambda (m) (string-prefix-p "acurl:" m)) logged)))
+      (should (string-match-p "127\\.0\\.0\\.1" m))
+      (should-not (string-match-p "S3CRET" m)))))
+
+(ert-deftest acurl-test-max-body-size ()
+  (let ((acurl-max-body-size 1000))
+    (should (= (acurl-response-size (cdr (acurl-test--run (acurl-test--url "/size/1000"))))
+               1000))
+    (dolist (path '("/size/1001" "/chunked/100000"))
+      (let ((out (acurl-test--run (acurl-test--url path))))
+        (should (eq (car out) 'error))
+        (should (eq (acurl-error-type (cdr out)) 'curl))
+        (should (= (acurl-error-code (cdr out)) 63))))
+    ;; HEAD reports the size, downloads go to disk.
+    (should (= (acurl-response-size
+                (cdr (acurl-test--run (acurl-test--url "/size/5000") :method "HEAD")))
+               5000))
+    (acurl-test--with-dir dir
+      (should (= (acurl-response-size
+                  (cdr (acurl-test--wait
+                        (lambda (ok ko)
+                          (acurl-download (acurl-test--url "/chunked/5000") dir
+                                          :on-success ok :on-error ko)))))
+                 5000))))
+  (let ((acurl-max-body-size nil))
+    (should (= (acurl-response-size (cdr (acurl-test--run (acurl-test--url "/chunked/100000"))))
+               100000))))
+
+(ert-deftest acurl-test-max-body-size-unknown-length ()
+  ;; curl before 8.4 does not stop a body of unknown size.
+  (let* ((file (make-temp-file "acurl-test-body-" nil nil (make-string 2000 ?x)))
+         (req (acurl--make-req :url "http://h/" :method "GET" :max-attempts 1
+                               :body-file file :max-body-size 1000))
+         result)
+    (setf (acurl--req-on-error req) (lambda (e) (setq result e)))
+    (acurl--handle-exit req 0 '((http_code . 200)) nil)
+    (should (eq (acurl-error-type result) 'curl))
+    (should (= (acurl-error-code result) 63))
+    (should-not (file-exists-p file))))
 
 (ert-deftest acurl-test-method-headers-body ()
   (let* ((r (cdr (acurl-test--run (acurl-test--url "/echo")
@@ -325,7 +535,7 @@ HANDLE-FN receives a success and an error callback.  Return
              (should (= (acurl-response-redirects redirect) 2))
              (should (= (acurl-response-attempts retry) 2))
              (should (= (acurl-response-attempts resume) 2))
-             (should (= (length commands) 6))
+             (should (= (length commands) 8))
              (dolist (command commands)
                (should-not (cl-some (lambda (arg) (string-match-p secret arg)) command))))
          (advice-remove 'make-process record))
@@ -344,6 +554,15 @@ HANDLE-FN receives a success and an error callback.  Return
          (r (cdr (acurl-test--run (acurl-test--url (format "/retry-after/%s/date" key))))))
     (should (= (acurl-response-status r) 200))
     (should (= (acurl-response-attempts r) 2))))
+
+(ert-deftest acurl-test-retry-after-unrepresentable ()
+  (should-not (acurl--parse-retry-after "Wed, 21 Oct 99999999999 07:28:00 GMT"))
+  (acurl-test--fast-retries
+   (let* ((key (acurl-test--key))
+          (r (cdr (acurl-test--run
+                   (acurl-test--url (format "/retry-after/%s/unrepresentable" key))))))
+     (should (= (acurl-response-status r) 200))
+     (should (= (acurl-response-attempts r) 2)))))
 
 (ert-deftest acurl-test-retry-after-cap ()
   (let* ((key (acurl-test--key))
@@ -463,6 +682,21 @@ HANDLE-FN receives a success and an error callback.  Return
       (acurl-test--wait (lambda (ok ko)
                           (acurl-download url dir :overwrite t :on-success ok :on-error ko)))
       (should (= (length (directory-files dir nil "\\`[^.]")) 3)))))
+
+(ert-deftest acurl-test-download-never-follows-symlink ()
+  (acurl-test--with-dir dir
+    (let ((victim (concat dir "victim"))
+          (url (acurl-test--url
+                (concat "/cd?v=" (url-hexify-string "attachment; filename=\"link\"")))))
+      (write-region "keep" nil victim nil 'silent)
+      (make-symbolic-link victim (concat dir "link"))
+      (acurl-test--wait (lambda (ok ko) (acurl-download url dir :on-success ok :on-error ko)))
+      (should (equal (acurl--read-file (concat dir "link-1")) "cd body"))
+      (acurl-test--wait (lambda (ok ko)
+                          (acurl-download url dir :overwrite t :on-success ok :on-error ko)))
+      (should-not (file-symlink-p (concat dir "link")))
+      (should (equal (acurl--read-file (concat dir "link")) "cd body"))
+      (should (equal (acurl--read-file victim) "keep")))))
 
 (ert-deftest acurl-test-download-url-name-and-file ()
   (acurl-test--with-dir dir
