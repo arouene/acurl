@@ -141,6 +141,11 @@ characters, leading dots and leading tildes are stripped. An existing file is
 never replaced unless `:overwrite` is non-nil: `name-1.ext`, `name-2.ext`, ...
 are used instead. This also applies to explicit file names.
 
+**Body size.** A body request fails with curl exit code 63 when the response
+is larger than `acurl-max-body-size` (100 MiB), so a hostile server cannot
+exhaust the memory of Emacs. Set it to `nil` for no limit. Downloads are not
+limited.
+
 **Concurrency.** At most `acurl-max-concurrent` curl processes run at once;
 other requests wait in a queue.
 

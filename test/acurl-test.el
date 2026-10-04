@@ -321,6 +321,42 @@ HANDLE-FN receives a success and an error callback.  Return
       (should (string-match-p "127\\.0\\.0\\.1" m))
       (should-not (string-match-p "S3CRET" m)))))
 
+(ert-deftest acurl-test-max-body-size ()
+  (let ((acurl-max-body-size 1000))
+    (should (= (acurl-response-size (cdr (acurl-test--run (acurl-test--url "/size/1000"))))
+               1000))
+    (dolist (path '("/size/1001" "/chunked/100000"))
+      (let ((out (acurl-test--run (acurl-test--url path))))
+        (should (eq (car out) 'error))
+        (should (eq (acurl-error-type (cdr out)) 'curl))
+        (should (= (acurl-error-code (cdr out)) 63))))
+    ;; HEAD reports the size, downloads go to disk.
+    (should (= (acurl-response-size
+                (cdr (acurl-test--run (acurl-test--url "/size/5000") :method "HEAD")))
+               5000))
+    (acurl-test--with-dir dir
+      (should (= (acurl-response-size
+                  (cdr (acurl-test--wait
+                        (lambda (ok ko)
+                          (acurl-download (acurl-test--url "/chunked/5000") dir
+                                          :on-success ok :on-error ko)))))
+                 5000))))
+  (let ((acurl-max-body-size nil))
+    (should (= (acurl-response-size (cdr (acurl-test--run (acurl-test--url "/chunked/100000"))))
+               100000))))
+
+(ert-deftest acurl-test-max-body-size-unknown-length ()
+  ;; curl before 8.4 does not stop a body of unknown size.
+  (let* ((file (make-temp-file "acurl-test-body-" nil nil (make-string 2000 ?x)))
+         (req (acurl--make-req :url "http://h/" :method "GET" :max-attempts 1
+                               :body-file file :max-body-size 1000))
+         result)
+    (setf (acurl--req-on-error req) (lambda (e) (setq result e)))
+    (acurl--handle-exit req 0 '((http_code . 200)) nil)
+    (should (eq (acurl-error-type result) 'curl))
+    (should (= (acurl-error-code result) 63))
+    (should-not (file-exists-p file))))
+
 (ert-deftest acurl-test-method-headers-body ()
   (let* ((r (cdr (acurl-test--run (acurl-test--url "/echo")
                                   :method "post"

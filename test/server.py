@@ -196,6 +196,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "Content-Type": "application/octet-stream",
                 "Content-Disposition": query["v"],
             })
+        elif name == "size":
+            self.reply(200, b"x" * int(args[0]), {"Content-Type": "application/octet-stream"})
+        elif name == "chunked":
+            # N bytes without Content-Length.
+            self.send_response(200)
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            for _ in range(int(args[0]) // 1000):
+                self.wfile.write(b"3e8\r\n" + b"x" * 1000 + b"\r\n")
+            self.wfile.write(b"0\r\n\r\n")
         elif name == "files":
             self.reply(200, b"file body", {"Content-Type": "text/plain"})
         else:

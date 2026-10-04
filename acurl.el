@@ -107,6 +107,12 @@ When nil, such responses go to the success callback.  Downloads always
 report them as errors."
   :type 'boolean)
 
+(defcustom acurl-max-body-size (* 100 1024 1024)
+  "Maximum size in bytes of a response body read into memory, or nil.
+A larger body fails with curl exit code 63, so a server cannot exhaust
+the memory of Emacs.  Downloads are not limited."
+  :type '(choice (const :tag "No limit" nil) natnum))
+
 (defcustom acurl-max-concurrent 6
   "Maximum number of curl processes running at the same time."
   :type 'natnum)
@@ -150,7 +156,7 @@ was received, else nil."
                           (:copier nil))
   url method headers body output directory-p on-success on-error
   connect-timeout timeout max-attempts max-redirects http-errors
-  overwrite extra-args
+  overwrite extra-args max-body-size
   (attempt 1) (state 'queued) process timer
   data-file header-file body-file partial resume-from validator disposition)
 
@@ -376,7 +382,11 @@ The URL and headers are passed on stdin, see `acurl--build-config'."
      (if (acurl--req-partial req)
          ;; --fail keeps error bodies out of the partial file.
          (list "--fail" "--continue-at" "-" "--output" (acurl--req-partial req))
-       (list "--output" (acurl--req-body-file req)))
+       (append (list "--output" (acurl--req-body-file req))
+               ;; HEAD would fail on a large Content-Length.
+               (when-let ((limit (and (not (equal method "HEAD"))
+                                      (acurl--req-max-body-size req))))
+                 (list "--max-filesize" (number-to-string limit)))))
      (cond ((equal method "HEAD") (list "--head"))
            ((acurl--req-data-file req)
             (append (list "--data-binary" (concat "@" (acurl--req-data-file req)))
@@ -463,6 +473,11 @@ EXIT is the curl exit code, WRITE-OUT the parsed metadata and HEADERS
 the final response headers."
   (let* ((status (or (alist-get 'http_code write-out) 0))
          (partial (acurl--req-partial req))
+         ;; curl before 8.4 does not stop a body of unknown size.
+         (oversized (and (not partial)
+                         (acurl--req-max-body-size req)
+                         (> (acurl--file-size (acurl--req-body-file req))
+                            (acurl--req-max-body-size req))))
          (resp (acurl--make-response
                 :status status
                 :url (or (alist-get 'url_effective write-out)
@@ -472,6 +487,9 @@ the final response headers."
                 :redirects (alist-get 'num_redirects write-out)
                 :attempts (acurl--req-attempt req)))
          (err (cond
+               (oversized
+                (acurl--make-error :type 'curl :code 63 :response resp
+                                   :message "Maximum file size exceeded"))
                ((and (= exit 0) (< status 400)) nil)
                ((= exit 28)
                 (acurl--make-error :type 'timeout :code exit :response resp
@@ -501,7 +519,9 @@ the final response headers."
               (and len (string-match-p "\\`[0-9]+\\'" len)
                    (string-to-number len)))))
      ((not partial)
-      (let ((bytes (or (acurl--read-file (acurl--req-body-file req)) "")))
+      (let ((bytes (or (and (not oversized)
+                                (acurl--read-file (acurl--req-body-file req)))
+                           "")))
         (setf (acurl-response-size resp) (length bytes)
               (acurl-response-body resp)
               (acurl--decode-body bytes (acurl-response-content-type resp))))))
@@ -707,6 +727,7 @@ Defaults come from the `acurl' customization group."
                 :max-redirects max-redirects
                 :http-errors http-errors :overwrite overwrite
                 :extra-args extra-args
+                :max-body-size acurl-max-body-size
                 :header-file (make-temp-file "acurl-headers-"))))
       (condition-case err
           (progn
