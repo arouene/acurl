@@ -60,7 +60,7 @@ Starts the request and returns a handle for `acurl-cancel`. Only `http://` and
 | `:body`            | `nil`                       | Request body string, multibyte strings are encoded as UTF-8           |
 | `:output`          | `nil`                       | Directory or file name: turns the request into a download             |
 | `:on-success`      | `ignore`                    | Called with an `acurl-response`                                       |
-| `:on-error`        | display the message         | Called with an `acurl-error`                                          |
+| `:on-error`        | display host and message    | Called with an `acurl-error`                                          |
 | `:connect-timeout` | `acurl-connect-timeout`     | Seconds to establish the connection                                   |
 | `:timeout`         | `acurl-timeout`             | Maximum seconds per attempt, `nil` for none                           |
 | `:max-attempts`    | `acurl-max-attempts`        | Attempts including the first                                          |

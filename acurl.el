@@ -667,7 +667,7 @@ named after the Content-Disposition header, the URL or
 a numeric suffix added unless OVERWRITE is non-nil.
 
 ON-SUCCESS is called with an `acurl-response'.  ON-ERROR is called with
-an `acurl-error'; it defaults to displaying the error message.
+an `acurl-error'; it defaults to displaying the host and error message.
 
 CONNECT-TIMEOUT and TIMEOUT are in seconds.  MAX-ATTEMPTS bounds the
 number of attempts, MAX-REDIRECTS the redirects followed.  HTTP-ERRORS
@@ -697,8 +697,10 @@ Defaults come from the `acurl' customization group."
                 :directory-p directory-p
                 :on-success (or on-success #'ignore)
                 :on-error (or on-error
+                              ;; The rest of the URL may hold secrets.
                               (lambda (err)
-                                (message "acurl: %s: %s" url
+                                (message "acurl: %s: %s"
+                                         (url-host (url-generic-parse-url url))
                                          (acurl-error-message err))))
                 :connect-timeout connect-timeout :timeout timeout
                 :max-attempts (max 1 max-attempts)

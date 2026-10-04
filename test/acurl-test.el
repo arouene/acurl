@@ -308,6 +308,19 @@ HANDLE-FN receives a success and an error callback.  Return
     (should (= (acurl-error-code (cdr out)) 7))
     (should (stringp (acurl-error-message (cdr out))))))
 
+(ert-deftest acurl-test-default-error-message-hides-secrets ()
+  (let (logged)
+    (cl-letf (((symbol-function 'message)
+               (lambda (format &rest args)
+                 (when format (push (apply #'format-message format args) logged)))))
+      (acurl-request "http://user:S3CRET@127.0.0.1:1/S3CRET?token=S3CRET" :max-attempts 1)
+      (with-timeout (10 (error "No error message"))
+        (while (not (cl-some (lambda (m) (string-prefix-p "acurl:" m)) logged))
+          (accept-process-output nil 0.05))))
+    (let ((m (cl-find-if (lambda (m) (string-prefix-p "acurl:" m)) logged)))
+      (should (string-match-p "127\\.0\\.0\\.1" m))
+      (should-not (string-match-p "S3CRET" m)))))
+
 (ert-deftest acurl-test-method-headers-body ()
   (let* ((r (cdr (acurl-test--run (acurl-test--url "/echo")
                                   :method "post"
