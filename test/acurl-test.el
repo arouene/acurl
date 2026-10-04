@@ -132,6 +132,8 @@
   (should-error (acurl-request "-o/tmp/x http://h/"))
   (should-error (acurl-request "http://h/\noutput = /tmp/x"))
   (should-error (acurl-request "http://h/" :headers '(("X" . "a\nb"))))
+  (should-error (acurl-request "http://h/" :method "GET / HTTP/1.1\r\nX-Injected: 1\r\nX:"))
+  (should-error (acurl-request "http://h/" :method "GET /other"))
   (should-error (acurl-download "http://h/" "/nonexistent-acurl-dir/x")))
 
 ;;;; Integration

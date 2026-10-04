@@ -288,12 +288,15 @@ one, and return BYTES unchanged otherwise."
 
 ;;;; Process management
 
+(defconst acurl--token-regexp "\\`[!#$%&'*+.^_`|~0-9A-Za-z-]+\\'"
+  "Regexp matching an HTTP token, the syntax of methods and header names.")
+
 (defun acurl--check-header (name value)
   "Return the curl header line for header NAME and VALUE.
 Signal an error if NAME is not a token or VALUE contains a line break."
   (let ((name (format "%s" name))
         (value (format "%s" value)))
-    (unless (string-match-p "\\`[!#$%&'*+.^_`|~0-9A-Za-z-]+\\'" name)
+    (unless (string-match-p acurl--token-regexp name)
       (error "Invalid header name: %S" name))
     (when (string-match-p "[\r\n\0]" value)
       (error "Invalid header value for %s" name))
@@ -647,6 +650,8 @@ Defaults come from the `acurl' customization group."
   (unless (executable-find acurl-curl-program)
     (error "Curl executable not found: %s" acurl-curl-program))
   (dolist (h headers) (acurl--check-header (car h) (cdr h)))
+  (unless (string-match-p acurl--token-regexp method)
+    (error "Invalid method: %S" method))
   (let* ((method (upcase method))
          (body (or body (and (member method '("POST" "PUT" "PATCH")) "")))
          (directory-p (and output (or (directory-name-p output)
