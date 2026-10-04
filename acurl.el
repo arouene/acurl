@@ -388,7 +388,7 @@ the headers listed in the redirect-headers slot of REQ are sent."
                               (acurl--config-quote
                                (acurl--check-header (car h) (cdr h)))))
                     (append headers
-                            (when-let ((v (acurl--req-validator req)))
+                            (when-let* ((v (acurl--req-validator req)))
                               (when (> (acurl--req-resume-from req) 0)
                                 (list (cons "If-Range" v)))))))
       "")
@@ -404,17 +404,17 @@ The URL and headers are passed on stdin, see `acurl--build-config'."
      (list "-q" "--silent" "--globoff" "--proto" "=http,https"
            "--dump-header" (acurl--req-header-file req)
            "--write-out" "%{json}")
-     (when-let ((ct (acurl--req-connect-timeout req)))
+     (when-let* ((ct (acurl--req-connect-timeout req)))
        (list "--connect-timeout" (number-to-string ct)))
-     (when-let ((tt (acurl--req-timeout req)))
+     (when-let* ((tt (acurl--req-timeout req)))
        (list "--max-time" (number-to-string tt)))
      (if (acurl--req-partial req)
          ;; --fail keeps error bodies out of the partial file.
          (list "--fail" "--continue-at" "-" "--output" (acurl--req-partial req))
        (append (list "--output" (acurl--req-body-file req))
                ;; HEAD would fail on a large Content-Length.
-               (when-let ((limit (and (not (equal method "HEAD"))
-                                      (acurl--req-max-body-size req))))
+               (when-let* ((limit (and (not (equal method "HEAD"))
+                                       (acurl--req-max-body-size req))))
                  (list "--max-filesize" (number-to-string limit)))))
      (cond ((equal method "HEAD") (list "--head"))
            ((acurl--req-data-file req)
@@ -435,7 +435,7 @@ The URL and headers are passed on stdin, see `acurl--build-config'."
   (setf (acurl--req-state req) 'running)
   (cl-incf acurl--active)
   (acurl--truncate (acurl--req-header-file req))
-  (when-let ((partial (acurl--req-partial req)))
+  (when-let* ((partial (acurl--req-partial req)))
     (setf (acurl--req-resume-from req) (acurl--file-size partial)))
   (let ((buffer (generate-new-buffer " *acurl*"))
         (stderr (generate-new-buffer " *acurl-stderr*")))
@@ -537,8 +537,8 @@ the final response headers."
                                    :message (or (alist-get 'errormsg write-out)
                                                 (format "curl exited with code %d"
                                                         exit)))))))
-    (when-let ((cd (and (not location)
-                        (cdr (assoc "content-disposition" headers)))))
+    (when-let* ((cd (and (not location)
+                         (cdr (assoc "content-disposition" headers)))))
       (setf (acurl--req-disposition req) cd))
     (when (and partial (= (acurl--req-resume-from req) 0))
       (setf (acurl--req-validator req)
@@ -616,7 +616,7 @@ RESP is the redirect response, reported when the redirect is refused."
                  (or (= status 303)
                      (and (memq status '(301 302)) (equal method "POST"))))
         (setf (acurl--req-method req) "GET")
-        (when-let ((data (acurl--req-data-file req)))
+        (when-let* ((data (acurl--req-data-file req)))
           (delete-file data)
           (setf (acurl--req-data-file req) nil)))
       (if (and (acurl--req-data-file req)
@@ -629,7 +629,7 @@ RESP is the redirect response, reported when the redirect is refused."
         ;; curl rejects the spaces some servers leave in Location.
         (setf (acurl--req-location req) (string-replace " " "%20" location))
         (cl-incf (acurl--req-redirects req))
-        (when-let ((partial (acurl--req-partial req)))
+        (when-let* ((partial (acurl--req-partial req)))
           (acurl--truncate partial))
         (acurl--enqueue req t))))))
 
@@ -714,7 +714,7 @@ RESP is the final response, used to name files in directory mode."
              (setq n (1+ n)
                    candidate (concat (file-name-sans-extension target)
                                      "-" (number-to-string n)
-                                     (if-let ((ext (file-name-extension target)))
+                                     (if-let* ((ext (file-name-extension target)))
                                          (concat "." ext)
                                        ""))))))
         candidate))))
