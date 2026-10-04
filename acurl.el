@@ -212,12 +212,14 @@ current time and is used for HTTP-dates."
   (when value
     (if (string-match "\\`[ \t]*\\([0-9]+\\)[ \t]*\\'" value)
         (string-to-number (match-string 1 value))
-      (let ((parsed (parse-time-string value)))
-        (when (and (cl-every #'integerp (cl-subseq parsed 0 6))
-                   (nth 8 parsed))
+      (let* ((parsed (parse-time-string value))
+             (time (and (cl-every #'integerp (cl-subseq parsed 0 6))
+                        (nth 8 parsed)
+                        ;; Signals for a year out of range.
+                        (ignore-errors (encode-time parsed)))))
+        (when time
           (max 0 (float-time
-                  (time-subtract (encode-time parsed)
-                                 (or now (current-time))))))))))
+                  (time-subtract time (or now (current-time))))))))))
 
 (defun acurl--unhex (string)
   "Return STRING with its %XX escapes decoded to bytes.

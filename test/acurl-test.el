@@ -382,6 +382,15 @@ HANDLE-FN receives a success and an error callback.  Return
     (should (= (acurl-response-status r) 200))
     (should (= (acurl-response-attempts r) 2))))
 
+(ert-deftest acurl-test-retry-after-unrepresentable ()
+  (should-not (acurl--parse-retry-after "Wed, 21 Oct 99999999999 07:28:00 GMT"))
+  (acurl-test--fast-retries
+   (let* ((key (acurl-test--key))
+          (r (cdr (acurl-test--run
+                   (acurl-test--url (format "/retry-after/%s/unrepresentable" key))))))
+     (should (= (acurl-response-status r) 200))
+     (should (= (acurl-response-attempts r) 2)))))
+
 (ert-deftest acurl-test-retry-after-cap ()
   (let* ((key (acurl-test--key))
          (acurl-retry-after-max 0)

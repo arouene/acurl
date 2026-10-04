@@ -99,7 +99,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # /retry-after/KEY/FORM: 503 with Retry-After once, then 200.
             key, form = args
             if hit(key) == 1:
-                value = "1" if form == "seconds" else email.utils.formatdate(time.time() + 1, usegmt=True)
+                value = {
+                    "seconds": "1",
+                    "date": email.utils.formatdate(time.time() + 1, usegmt=True),
+                    "unrepresentable": "Wed, 21 Oct 99999999999 07:28:00 GMT",
+                }[form]
                 self.reply(503, b"busy", {"Retry-After": value})
             else:
                 self.reply(200, b"ok", {"Content-Type": "text/plain"})
