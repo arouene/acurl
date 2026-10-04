@@ -136,6 +136,20 @@
   (should-error (acurl-request "http://h/" :method "GET /other"))
   (should-error (acurl-download "http://h/" "/nonexistent-acurl-dir/x")))
 
+(ert-deftest acurl-test-request-error-cleans-temp-files ()
+  (let* ((dir (file-name-as-directory (make-temp-file "acurl-test-" t)))
+         (temporary-file-directory dir)
+         (make-temp-file-orig (symbol-function 'make-temp-file)))
+    (unwind-protect
+        (cl-letf (((symbol-function 'make-temp-file)
+                   (lambda (prefix &rest args)
+                     (if (string-match-p "\\.acurl-" prefix)
+                         (error "Disk full")
+                       (apply make-temp-file-orig prefix args)))))
+          (should-error (acurl-download "http://127.0.0.1:1/" dir :body "secret"))
+          (should-not (directory-files dir nil "\\`[^.]")))
+      (delete-directory dir t))))
+
 ;;;; Integration
 
 (defvar acurl-test--server nil)

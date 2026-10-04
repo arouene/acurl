@@ -598,13 +598,17 @@ RESP is the final response, used to name files in directory mode."
                                        ""))))))
         candidate))))
 
-(defun acurl--finish (req err &optional resp)
-  "Mark REQ as done, clean up and call its callback with ERR or RESP."
-  (setf (acurl--req-state req) 'done)
+(defun acurl--delete-files (req)
+  "Delete the temporary files of REQ."
   (dolist (file (list (acurl--req-data-file req) (acurl--req-header-file req)
                       (acurl--req-body-file req) (acurl--req-partial req)))
     (when (and file (file-exists-p file))
-      (delete-file file)))
+      (delete-file file))))
+
+(defun acurl--finish (req err &optional resp)
+  "Mark REQ as done, clean up and call its callback with ERR or RESP."
+  (setf (acurl--req-state req) 'done)
+  (acurl--delete-files req)
   (acurl--pump)
   (if err
       (funcall (acurl--req-on-error req) err)
@@ -676,19 +680,24 @@ Defaults come from the `acurl' customization group."
                 :http-errors http-errors :overwrite overwrite
                 :extra-args extra-args
                 :header-file (make-temp-file "acurl-headers-"))))
-      (when body
-        (let ((file (make-temp-file "acurl-data-"))
-              (coding-system-for-write 'binary))
-          (setf (acurl--req-data-file req) file)
-          (write-region (if (multibyte-string-p body)
-                            (encode-coding-string body 'utf-8)
-                          body)
-                        nil file nil 'silent)))
-      (if output
-          (setf (acurl--req-partial req)
-                (make-temp-file (expand-file-name ".acurl-" target-dir)
-                                nil ".part"))
-        (setf (acurl--req-body-file req) (make-temp-file "acurl-body-")))
+      (condition-case err
+          (progn
+            (when body
+              (let ((file (make-temp-file "acurl-data-"))
+                    (coding-system-for-write 'binary))
+                (setf (acurl--req-data-file req) file)
+                (write-region (if (multibyte-string-p body)
+                                  (encode-coding-string body 'utf-8)
+                                body)
+                              nil file nil 'silent)))
+            (if output
+                (setf (acurl--req-partial req)
+                      (make-temp-file (expand-file-name ".acurl-" target-dir)
+                                      nil ".part"))
+              (setf (acurl--req-body-file req) (make-temp-file "acurl-body-"))))
+        ;; The data file holds the body, which may be secret.
+        (t (acurl--delete-files req)
+           (signal (car err) (cdr err))))
       (acurl--enqueue req)
       req)))
 
