@@ -122,7 +122,7 @@ When nil, a numeric suffix makes the file name unique."
   :type 'string)
 
 (defcustom acurl-extra-args nil
-  "Extra arguments passed to curl before the URL, for every request."
+  "Extra arguments passed on the curl command line, for every request."
   :type '(repeat string))
 
 (cl-defstruct (acurl-response (:constructor acurl--make-response)
@@ -639,7 +639,7 @@ an `acurl-error'; it defaults to displaying the error message.
 CONNECT-TIMEOUT and TIMEOUT are in seconds.  MAX-ATTEMPTS bounds the
 number of attempts, MAX-REDIRECTS the redirects followed.  HTTP-ERRORS
 controls whether status 400 and above is an error for body requests.
-EXTRA-ARGS is a list of strings passed to curl before the URL.
+EXTRA-ARGS is a list of strings passed on the curl command line.
 
 Defaults come from the `acurl' customization group."
   (unless (string-match-p "\\`https?://[^\r\n\0]*\\'" url)
