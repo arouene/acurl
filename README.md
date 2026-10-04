@@ -144,10 +144,13 @@ reach the file.
 
 **File names.** In directory mode the name comes from the Content-Disposition
 `filename*` (RFC 5987) or `filename` parameter, then the last path segment of
-the final URL, then `acurl-default-filename`. Path components, control
-characters, leading dots and leading tildes are stripped. An existing file is
-never replaced unless `:overwrite` is non-nil: `name-1.ext`, `name-2.ext`, ...
-are used instead. This also applies to explicit file names.
+the final URL, then `acurl-default-filename`. Path components, leading dots and
+leading tildes are stripped. Control and format characters (such as a
+right-to-left override that disguises the extension) and characters reserved on
+Windows become `_`, and on Windows a device name such as `NUL` or `COM1` gets a
+`_` prefix. An existing file is never replaced unless `:overwrite` is non-nil:
+`name-1.ext`, `name-2.ext`, ... are used instead. This also applies to explicit
+file names.
 
 **Body size.** A body request fails with curl exit code 63 when the response
 is larger than `acurl-max-body-size` (100 MiB), so a hostile server cannot
@@ -158,14 +161,14 @@ limited.
 other requests wait in a queue.
 
 **Safety.** curl runs without a shell, with `~/.curlrc` disabled, URL globbing
-off and only HTTP and HTTPS allowed for the URL and redirects. Header names
-must be valid tokens and header values cannot contain line breaks. The URL
-and headers reach curl as a config on stdin and the body through a temporary
-file, so tokens and secrets in the query string never appear in curl's command
-line, which other local users can read with `ps`. `:extra-args` and
-`acurl-extra-args` are still passed on the command line. Metadata
-comes from curl `--write-out '%{json}'` on stdout while the body goes to a
-file, so a body can never corrupt the metadata.
+off and only HTTP and HTTPS allowed for the URL and redirects. Methods and
+header names must be valid tokens and header values cannot contain line breaks.
+The URL and headers reach curl as a config on stdin and the body through a
+temporary file, so tokens and secrets in the query string never appear in
+curl's command line, which other local users can read with `ps`. `:extra-args`
+and `acurl-extra-args` are still passed on the command line. Metadata comes
+from curl `--write-out '%{json}'` on stdout while the body goes to a file, so a
+body can never corrupt the metadata.
 
 The `acurl` customization group (`M-x customize-group RET acurl`) holds every
 default, including `acurl-curl-program` and `acurl-extra-args`.
