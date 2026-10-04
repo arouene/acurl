@@ -303,7 +303,7 @@ Use the charset parameter when known, UTF-8 for textual types without
 one, and return BYTES unchanged otherwise."
   (let* ((ct (downcase (or content-type "")))
          (charset (and (string-match "charset=\"?\\([^\";[:space:]]+\\)" ct)
-                       (intern (match-string 1 ct))))
+                       (intern-soft (match-string 1 ct))))
          (coding (cond ((and charset (coding-system-p charset)) charset)
                        ((string-match-p
                          (concat "\\`\\(?:text/\\|application/"

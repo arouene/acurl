@@ -120,7 +120,10 @@
     (should (equal (acurl--decode-body bytes "application/vnd.api+json") "é"))
     (should (equal (acurl--decode-body bytes "application/octet-stream") bytes))
     (should (equal (acurl--decode-body bytes nil) bytes)))
-  (should (equal (acurl--decode-body "\351" "text/plain; charset=ISO-8859-1") "é")))
+  (should (equal (acurl--decode-body "\351" "text/plain; charset=ISO-8859-1") "é"))
+  ;; A server must not grow the obarray with names of its choice.
+  (should (equal (acurl--decode-body "x" "text/plain; charset=acurl-test-no-such-charset") "x"))
+  (should-not (intern-soft "acurl-test-no-such-charset")))
 
 (ert-deftest acurl-test-hostile-values-linear-time ()
   ;; Server values reach curl's 100 KB header limit: quadratic parsing
