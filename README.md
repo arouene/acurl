@@ -146,7 +146,11 @@ other requests wait in a queue.
 
 **Safety.** curl runs without a shell, with `~/.curlrc` disabled, URL globbing
 off and only HTTP and HTTPS allowed for the URL and redirects. Header names
-must be valid tokens and header values cannot contain line breaks. Metadata
+must be valid tokens and header values cannot contain line breaks. The URL
+and headers reach curl as a config on stdin and the body through a temporary
+file, so tokens and secrets in the query string never appear in curl's command
+line, which other local users can read with `ps`. `:extra-args` and
+`acurl-extra-args` are still passed on the command line. Metadata
 comes from curl `--write-out '%{json}'` on stdout while the body goes to a
 file, so a body can never corrupt the metadata.
 
