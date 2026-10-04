@@ -86,6 +86,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             n = int(args[0])
             target = f"/redirect/{n - 1}" if n > 1 else "/text"
             self.reply(302, b"", {"Location": target})
+        elif name == "redirect-to":
+            # /redirect-to?url=URL&status=N, with a body and a file name
+            # that must not reach a download.
+            self.reply(int(query.get("status", "302")), b"redirect body", {
+                "Location": query["url"],
+                "Content-Disposition": 'attachment; filename="wrong.txt"',
+            })
         elif name == "redirect-loop":
             self.reply(302, b"", {"Location": "/redirect-loop"})
         elif name == "echo":

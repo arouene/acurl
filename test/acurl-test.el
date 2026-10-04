@@ -291,6 +291,80 @@ HANDLE-FN receives a success and an error callback.  Return
     (should (eq (acurl-error-type (cdr out)) 'curl))
     (should (= (acurl-error-code (cdr out)) 47))))
 
+(defun acurl-test--redirect-url (target &optional status)
+  "Return a test server URL redirecting to TARGET with STATUS."
+  (acurl-test--url (format "/redirect-to?status=%s&url=%s"
+                           (or status 302) (url-hexify-string target))))
+
+(defun acurl-test--echo (url &rest args)
+  "Return the request seen by the /echo endpoint at the end of URL.
+ARGS are passed to `acurl-request'."
+  (let ((json-object-type 'alist))
+    (json-read-from-string
+     (acurl-response-body (cdr (apply #'acurl-test--run url args))))))
+
+(ert-deftest acurl-test-redirect-cross-origin-headers ()
+  (acurl-test--ensure-server)
+  (let ((headers '(("Authorization" . "Bearer S3CRET") ("X-Api-Key" . "S3CRET")
+                   ("Accept" . "application/json")))
+        (other (format "http://localhost:%s/echo" acurl-test--port)))
+    (let ((h (alist-get 'headers (acurl-test--echo (acurl-test--redirect-url "/echo")
+                                                   :headers headers))))
+      (should (equal (alist-get 'authorization h) "Bearer S3CRET"))
+      (should (equal (alist-get 'x-api-key h) "S3CRET")))
+    (let ((h (alist-get 'headers (acurl-test--echo (acurl-test--redirect-url other)
+                                                   :headers headers))))
+      (should-not (alist-get 'authorization h))
+      (should-not (alist-get 'x-api-key h))
+      (should-not (equal (alist-get 'accept h) "application/json")))
+    ;; Back on the original origin, the headers are sent again.
+    (let ((h (alist-get 'headers (acurl-test--echo
+                                  (acurl-test--redirect-url
+                                   (format "http://localhost:%s/redirect-to?url=%s"
+                                           acurl-test--port
+                                           (url-hexify-string (acurl-test--url "/echo"))))
+                                  :headers headers))))
+      (should (equal (alist-get 'x-api-key h) "S3CRET")))
+    (let* ((acurl-redirect-headers '("accept" "X-Api-Key"))
+           (h (alist-get 'headers (acurl-test--echo (acurl-test--redirect-url other)
+                                                    :headers headers))))
+      (should-not (alist-get 'authorization h))
+      (should (equal (alist-get 'x-api-key h) "S3CRET"))
+      (should (equal (alist-get 'accept h) "application/json")))))
+
+(ert-deftest acurl-test-redirect-protocols ()
+  (dolist (target '("file:///etc/passwd" "ftp://127.0.0.1/x"))
+    (let ((out (acurl-test--run (acurl-test--redirect-url target))))
+      (should (eq (car out) 'error))
+      (should (eq (acurl-error-type (cdr out)) 'curl))
+      (should (= (acurl-error-code (cdr out)) 1)))))
+
+(ert-deftest acurl-test-redirect-methods ()
+  (pcase-dolist (`(,method ,status ,new-method ,new-body)
+                 '(("POST" 302 "GET" "") ("POST" 303 "GET" "")
+                   ("POST" 307 "POST" "data") ("POST" 308 "POST" "data")
+                   ("PUT" 302 "PUT" "data") ("PUT" 303 "GET" "")))
+    (let ((echo (acurl-test--echo (acurl-test--redirect-url "/echo" status)
+                                  :method method :body "data")))
+      (should (equal (list method status (alist-get 'method echo) (alist-get 'body echo))
+                     (list method status new-method new-body)))))
+  (let ((r (cdr (acurl-test--run (acurl-test--redirect-url "/text" 303) :method "HEAD"))))
+    (should (= (acurl-response-status r) 200))
+    (should (= (acurl-response-size r) 13))))
+
+(ert-deftest acurl-test-redirect-download ()
+  (acurl-test--with-dir dir
+    (let ((r (cdr (acurl-test--wait
+                   (lambda (ok ko)
+                     ;; curl leaves the space of an absolute Location.
+                     (acurl-download (acurl-test--redirect-url
+                                      (acurl-test--url "/files/a b.txt"))
+                                     dir
+                                     :on-success ok :on-error ko))))))
+      (should (equal (acurl-response-file r) (expand-file-name "a b.txt" dir)))
+      (should (= (acurl-response-redirects r) 1))
+      (should (equal (acurl--read-file (acurl-response-file r)) "file body")))))
+
 (ert-deftest acurl-test-http-errors ()
   (let ((out (acurl-test--run (acurl-test--url "/status/404"))))
     (should (eq (car out) 'error))
@@ -423,7 +497,7 @@ HANDLE-FN receives a success and an error callback.  Return
              (should (= (acurl-response-redirects redirect) 2))
              (should (= (acurl-response-attempts retry) 2))
              (should (= (acurl-response-attempts resume) 2))
-             (should (= (length commands) 6))
+             (should (= (length commands) 8))
              (dolist (command commands)
                (should-not (cl-some (lambda (arg) (string-match-p secret arg)) command))))
          (advice-remove 'make-process record))

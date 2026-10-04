@@ -125,6 +125,14 @@ delta-seconds or HTTP-date form, replaces the backoff, capped at
 request: connection failures and status 429 or 503. Retries wait on Emacs
 timers and never block.
 
+**Redirects.** acurl follows up to `:max-redirects` redirects (301, 302, 303,
+307 and 308) to `http://` and `https://` URLs. 303, and 301 or 302 after a
+`POST`, switch to `GET` without a body. A redirect to another origin (scheme,
+host or port) drops the request headers, so credentials such as
+`Authorization` or an API key header never reach a third party; they are sent
+again once a redirect leads back to the original origin. Headers named in
+`acurl-redirect-headers` (for example `'("Accept" "User-Agent")`) are kept.
+
 **Resume.** A download writes to a hidden `.acurl-*.part` file next to its
 destination. A retry resumes it with a range request, guarded by `If-Range`
 with the ETag (or Last-Modified) of the first response. If the server ignores

@@ -67,6 +67,13 @@ A download interrupted by this timeout resumes on the next attempt."
   "Default maximum number of redirects to follow."
   :type 'natnum)
 
+(defcustom acurl-redirect-headers nil
+  "Names of the request headers kept on a redirect to another origin.
+A redirect to another scheme, host or port drops the other headers, so
+credentials such as Authorization or an API key header never reach a
+third party."
+  :type '(repeat string))
+
 (defcustom acurl-max-attempts 3
   "Default maximum number of attempts per request, including the first."
   :type 'natnum)
@@ -156,8 +163,8 @@ was received, else nil."
                           (:copier nil))
   url method headers body output directory-p on-success on-error
   connect-timeout timeout max-attempts max-redirects http-errors
-  overwrite extra-args max-body-size
-  (attempt 1) (state 'queued) process timer
+  overwrite extra-args max-body-size redirect-headers
+  location (redirects 0) (attempt 1) (state 'queued) process timer
   data-file header-file body-file partial resume-from validator disposition)
 
 (defvar acurl--queue nil
@@ -344,35 +351,49 @@ would end the config line."
     (error "Line break or null byte in curl config value"))
   (concat "\"" (replace-regexp-in-string "[\\\"]" "\\\\\\&" string) "\""))
 
+(defun acurl--origin (url)
+  "Return the scheme, host and port of URL."
+  (let ((u (url-generic-parse-url url)))
+    (list (downcase (url-type u)) (downcase (or (url-host u) ""))
+          (url-port u))))
+
 (defun acurl--build-config (req)
   "Return the curl config for REQ, holding its URL and headers.
 curl reads it from stdin, so these secrets stay out of its command line,
-which any local user can read."
-  (encode-coding-string
-   (mapconcat
-    (lambda (line) (concat line "\n"))
-    (cons (concat "url = " (acurl--config-quote (acurl--req-url req)))
-          (mapcar (lambda (h)
-                    (concat "header = "
-                            (acurl--config-quote
-                             (acurl--check-header (car h) (cdr h)))))
-                  (append (acurl--req-headers req)
-                          (when-let ((v (acurl--req-validator req)))
-                            (when (> (acurl--req-resume-from req) 0)
-                              (list (cons "If-Range" v)))))))
-    "")
-   'utf-8))
+which any local user can read.  After a redirect to another origin, only
+the headers listed in the redirect-headers slot of REQ are sent."
+  (let* ((url (or (acurl--req-location req) (acurl--req-url req)))
+         (headers (if (equal (acurl--origin url)
+                             (acurl--origin (acurl--req-url req)))
+                      (acurl--req-headers req)
+                    (cl-remove-if-not
+                     (lambda (h)
+                       (member-ignore-case (format "%s" (car h))
+                                           (acurl--req-redirect-headers req)))
+                     (acurl--req-headers req)))))
+    (encode-coding-string
+     (mapconcat
+      (lambda (line) (concat line "\n"))
+      (cons (concat "url = " (acurl--config-quote url))
+            (mapcar (lambda (h)
+                      (concat "header = "
+                              (acurl--config-quote
+                               (acurl--check-header (car h) (cdr h)))))
+                    (append headers
+                            (when-let ((v (acurl--req-validator req)))
+                              (when (> (acurl--req-resume-from req) 0)
+                                (list (cons "If-Range" v)))))))
+      "")
+     'utf-8)))
 
 (defun acurl--build-args (req)
   "Return the curl argument list for REQ.
 The URL and headers are passed on stdin, see `acurl--build-config'."
   (let ((method (acurl--req-method req)))
     (append
-     ;; -q must come first: it disables ~/.curlrc.
-     (list "-q" "--silent" "--globoff"
-           "--proto" "=http,https" "--proto-redir" "=http,https"
-           "--location" "--max-redirs"
-           (number-to-string (acurl--req-max-redirects req))
+     ;; -q must come first: it disables ~/.curlrc.  Redirects are
+     ;; followed by `acurl--follow', which controls the headers sent.
+     (list "-q" "--silent" "--globoff" "--proto" "=http,https"
            "--dump-header" (acurl--req-header-file req)
            "--write-out" "%{json}")
      (when-let ((ct (acurl--req-connect-timeout req)))
@@ -473,6 +494,10 @@ EXIT is the curl exit code, WRITE-OUT the parsed metadata and HEADERS
 the final response headers."
   (let* ((status (or (alist-get 'http_code write-out) 0))
          (partial (acurl--req-partial req))
+         (location (let ((target (alist-get 'redirect_url write-out)))
+                     (and (memq status '(301 302 303 307 308))
+                          (stringp target) (not (string-empty-p target))
+                          target)))
          ;; curl before 8.4 does not stop a body of unknown size.
          (oversized (and (not partial)
                          (acurl--req-max-body-size req)
@@ -481,10 +506,11 @@ the final response headers."
          (resp (acurl--make-response
                 :status status
                 :url (or (alist-get 'url_effective write-out)
+                         (acurl--req-location req)
                          (acurl--req-url req))
                 :headers headers
                 :content-type (alist-get 'content_type write-out)
-                :redirects (alist-get 'num_redirects write-out)
+                :redirects (acurl--req-redirects req)
                 :attempts (acurl--req-attempt req)))
          (err (cond
                (oversized
@@ -503,7 +529,8 @@ the final response headers."
                                    :message (or (alist-get 'errormsg write-out)
                                                 (format "curl exited with code %d"
                                                         exit)))))))
-    (when-let ((cd (cdr (assoc "content-disposition" headers))))
+    (when-let ((cd (and (not location)
+                        (cdr (assoc "content-disposition" headers)))))
       (setf (acurl--req-disposition req) cd))
     (when (and partial (= (acurl--req-resume-from req) 0))
       (setf (acurl--req-validator req)
@@ -526,6 +553,7 @@ the final response headers."
               (acurl-response-body resp)
               (acurl--decode-body bytes (acurl-response-content-type resp))))))
     (cond
+     ((and location (not err)) (acurl--follow req resp location))
      ;; Partial file rejected: the server ignored the range or the
      ;; resource changed (33), or it cannot satisfy the range (416).
      ;; Restart from scratch, no attempt used.
@@ -557,6 +585,38 @@ the final response headers."
                 (acurl-response-file resp) file
                 (acurl-response-size resp) (acurl--file-size file))
           (acurl--finish req nil resp)))))))
+
+(defun acurl--follow (req resp location)
+  "Start the next request of REQ to redirect target LOCATION.
+RESP is the redirect response, reported when the redirect is refused."
+  (let ((status (acurl-response-status resp))
+        (method (acurl--req-method req)))
+    (cond
+     ((>= (acurl--req-redirects req) (acurl--req-max-redirects req))
+      (acurl--finish req (acurl--make-error
+                          :type 'curl :code 47 :response resp
+                          :message (format "Maximum (%d) redirects followed"
+                                           (acurl--req-max-redirects req)))))
+     ((not (string-match-p "\\`https?://" location))
+      (acurl--finish req (acurl--make-error
+                          :type 'curl :code 1 :response resp
+                          :message "Redirect to an unsupported protocol")))
+     (t
+      ;; As curl and browsers do: 303, and 301 or 302 after POST, switch
+      ;; to GET without a body.
+      (when (and (not (equal method "HEAD"))
+                 (or (= status 303)
+                     (and (memq status '(301 302)) (equal method "POST"))))
+        (setf (acurl--req-method req) "GET")
+        (when-let ((data (acurl--req-data-file req)))
+          (delete-file data)
+          (setf (acurl--req-data-file req) nil)))
+      ;; curl rejects the spaces some servers leave in Location.
+      (setf (acurl--req-location req) (string-replace " " "%20" location))
+      (cl-incf (acurl--req-redirects req))
+      (when-let ((partial (acurl--req-partial req)))
+        (acurl--truncate partial))
+      (acurl--enqueue req t)))))
 
 (defun acurl--file-size (file)
   "Return the size of FILE in bytes, or 0 if it does not exist."
@@ -690,9 +750,11 @@ ON-SUCCESS is called with an `acurl-response'.  ON-ERROR is called with
 an `acurl-error'; it defaults to displaying the host and error message.
 
 CONNECT-TIMEOUT and TIMEOUT are in seconds.  MAX-ATTEMPTS bounds the
-number of attempts, MAX-REDIRECTS the redirects followed.  HTTP-ERRORS
-controls whether status 400 and above is an error for body requests.
-EXTRA-ARGS is a list of strings passed on the curl command line.
+number of attempts, MAX-REDIRECTS the redirects followed.  A redirect to
+another origin drops HEADERS, except those in `acurl-redirect-headers'.
+HTTP-ERRORS controls whether status 400 and above is an error for body
+requests.  EXTRA-ARGS is a list of strings passed on the curl command
+line.
 
 Defaults come from the `acurl' customization group."
   (unless (string-match-p "\\`https?://[^\r\n\0]*\\'" url)
@@ -728,6 +790,7 @@ Defaults come from the `acurl' customization group."
                 :http-errors http-errors :overwrite overwrite
                 :extra-args extra-args
                 :max-body-size acurl-max-body-size
+                :redirect-headers acurl-redirect-headers
                 :header-file (make-temp-file "acurl-headers-"))))
       (condition-case err
           (progn
